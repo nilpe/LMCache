@@ -80,32 +80,46 @@ static inline void do_memcpy(void *dst, const void *src, size_t size, int mode) 
 }
 
 /* ============================================================
- * Work-stealing sub-batch copy
+ * Work-stealing sub-batch copy (fine-grained, 1 MB sub-tasks)
+ *
+ * 旧実装は 1 chunk を 1 タスクとして work-steal していたため、
+ * sub-batch あたりの chunk 数 (e.g. 16) に並列度が抑えられ、
+ * max_threads=47 でも実質 16 threads しか使えなかった。
+ *
+ * 新実装は各 chunk を 1 MB sub-task に分割し、47 threads が
+ * 全 sub-task を work-steal するので、PMem read + DRAM write の
+ * memory 帯域幅を飽和させられる。
  * ============================================================ */
+#define PIPELINE_SUB_TASK_SIZE (1UL * 1024 * 1024)
 
 typedef struct {
-    const void *base;       /* DevDAX mmap base */
-    const int64_t *offsets;
-    void **dsts;
-    const int64_t *sizes;
-    volatile int *next_task;
-    int start;              /* first task index in this sub-batch */
-    int end;                /* one past last task index */
-    int mode;
-} subbatch_ws_t;
+    const char *src;   /* (base + offset) for this chunk */
+    char *dst;         /* dst pointer for this chunk */
+    size_t sub_offset; /* byte offset within chunk */
+    size_t sub_size;   /* sub-task size (<= 1 MB) */
+} subbatch_fine_task_t;
 
-static void *_subbatch_worker(void *arg) {
-    subbatch_ws_t *ws = (subbatch_ws_t *)arg;
+typedef struct {
+    subbatch_fine_task_t *tasks;
+    volatile int *next_task;
+    int count;
+    int mode;
+} subbatch_fine_ws_t;
+
+static void *_subbatch_worker_fine(void *arg) {
+    subbatch_fine_ws_t *ws = (subbatch_fine_ws_t *)arg;
     while (1) {
         int idx = __sync_fetch_and_add(ws->next_task, 1);
-        if (idx >= ws->end) break;
-        const void *src = (const char *)ws->base + ws->offsets[idx];
-        do_memcpy(ws->dsts[idx], src, (size_t)ws->sizes[idx], ws->mode);
+        if (idx >= ws->count) break;
+        subbatch_fine_task_t *t = &ws->tasks[idx];
+        do_memcpy(t->dst + t->sub_offset,
+                  t->src + t->sub_offset,
+                  t->sub_size, ws->mode);
     }
     return NULL;
 }
 
-/* Copy one sub-batch using work-stealing threads */
+/* Copy one sub-batch using fine-grained work-stealing. */
 static void copy_subbatch(
     const void *base,
     const int64_t *offsets,
@@ -115,19 +129,47 @@ static void copy_subbatch(
     int max_threads, int mode,
     pthread_t *threads  /* pre-allocated thread array */
 ) {
-    int count = end - start;
-    int nt = max_threads < count ? max_threads : count;
+    /* Build fine-grained task list (1 MB sub-tasks) */
+    int total_sub = 0;
+    for (int i = start; i < end; i++)
+        total_sub += ((size_t)sizes[i] + PIPELINE_SUB_TASK_SIZE - 1) / PIPELINE_SUB_TASK_SIZE;
 
-    volatile int next_task = start;
-    subbatch_ws_t ws = {
-        .base = base, .offsets = offsets, .dsts = dsts, .sizes = sizes,
-        .next_task = &next_task, .start = start, .end = end, .mode = mode
+    subbatch_fine_task_t *tasks = (subbatch_fine_task_t *)malloc(
+        total_sub * sizeof(subbatch_fine_task_t));
+    if (!tasks) return;
+
+    int ti = 0;
+    for (int i = start; i < end; i++) {
+        const char *src = (const char *)base + offsets[i];
+        char *dst = (char *)dsts[i];
+        size_t remaining = (size_t)sizes[i];
+        size_t off = 0;
+        while (remaining > 0) {
+            size_t sz = remaining < PIPELINE_SUB_TASK_SIZE
+                ? remaining : PIPELINE_SUB_TASK_SIZE;
+            tasks[ti].src = src;
+            tasks[ti].dst = dst;
+            tasks[ti].sub_offset = off;
+            tasks[ti].sub_size = sz;
+            ti++;
+            off += sz;
+            remaining -= sz;
+        }
+    }
+
+    int nt = max_threads < total_sub ? max_threads : total_sub;
+    volatile int next_task = 0;
+    subbatch_fine_ws_t ws = {
+        .tasks = tasks, .next_task = &next_task,
+        .count = total_sub, .mode = mode
     };
 
     for (int i = 0; i < nt; i++)
-        pthread_create(&threads[i], NULL, _subbatch_worker, &ws);
+        pthread_create(&threads[i], NULL, _subbatch_worker_fine, &ws);
     for (int i = 0; i < nt; i++)
         pthread_join(threads[i], NULL);
+
+    free(tasks);
 }
 
 /*
