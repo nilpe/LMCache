@@ -231,6 +231,7 @@ int fast_read_batch(const char **paths, void *dst, int count, size_t size, int m
  */
 
 #include <pthread.h>
+#include "thread_pool.h"
 
 typedef struct {
     const char *path;    /* FSDAX: file path, DevDAX: NULL */
@@ -279,21 +280,24 @@ static void *_ws_worker(void *arg) {
     return NULL;
 }
 
+/* Pool-based parallel_read: shared persistent workers, no per-call pthread overhead. */
+static void _ws_pool_worker(void *arg) {
+    ws_arg_t *ws = (ws_arg_t *)arg;
+    while (1) {
+        int idx = __sync_fetch_and_add(ws->next_task, 1);
+        if (idx >= ws->count) break;
+        _parallel_read_worker(&ws->tasks[idx]);
+    }
+}
+
 int parallel_read(read_task_t *tasks, int count, int max_threads) {
-    if (max_threads <= 0 || max_threads > count) max_threads = count;
+    if (max_threads <= 0) max_threads = count;
 
     volatile int next_task = 0;
     ws_arg_t ws = { .tasks = tasks, .next_task = &next_task, .count = count };
 
-    pthread_t *threads = (pthread_t *)malloc(max_threads * sizeof(pthread_t));
-    if (!threads) return -1;
-
-    for (int i = 0; i < max_threads; i++)
-        pthread_create(&threads[i], NULL, _ws_worker, &ws);
-    for (int i = 0; i < max_threads; i++)
-        pthread_join(threads[i], NULL);
-
-    free(threads);
+    thread_pool_t *pool = thread_pool_get(max_threads);
+    thread_pool_parallel_for(pool, _ws_pool_worker, &ws);
     return 0;
 }
 

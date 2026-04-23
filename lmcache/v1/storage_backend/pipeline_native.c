@@ -18,6 +18,7 @@
 #include <time.h>
 #include <immintrin.h>
 #include <pthread.h>
+#include "thread_pool.h"
 
 /* Profiling (same pattern as bar1_bridge.cu). Gated by LMCACHE_PROFILE=1. */
 static int g_profile_enabled = -1;
@@ -80,23 +81,18 @@ static inline void do_memcpy(void *dst, const void *src, size_t size, int mode) 
 }
 
 /* ============================================================
- * Work-stealing sub-batch copy (fine-grained, 1 MB sub-tasks)
+ * Work-stealing sub-batch copy using persistent thread pool.
  *
- * 旧実装は 1 chunk を 1 タスクとして work-steal していたため、
- * sub-batch あたりの chunk 数 (e.g. 16) に並列度が抑えられ、
- * max_threads=47 でも実質 16 threads しか使えなかった。
- *
- * 新実装は各 chunk を 1 MB sub-task に分割し、47 threads が
- * 全 sub-task を work-steal するので、PMem read + DRAM write の
- * memory 帯域幅を飽和させられる。
+ * 各 chunk を 4 MB sub-task に分割、pool の 47 worker が全 sub-task を
+ * atomic カウンタで work-steal する。pthread_create/join は pool 初回のみ。
  * ============================================================ */
-#define PIPELINE_SUB_TASK_SIZE (1UL * 1024 * 1024)
+#define PIPELINE_SUB_TASK_SIZE (4UL * 1024 * 1024)
 
 typedef struct {
-    const char *src;   /* (base + offset) for this chunk */
-    char *dst;         /* dst pointer for this chunk */
-    size_t sub_offset; /* byte offset within chunk */
-    size_t sub_size;   /* sub-task size (<= 1 MB) */
+    const char *src;
+    char *dst;
+    size_t sub_offset;
+    size_t sub_size;
 } subbatch_fine_task_t;
 
 typedef struct {
@@ -106,7 +102,7 @@ typedef struct {
     int mode;
 } subbatch_fine_ws_t;
 
-static void *_subbatch_worker_fine(void *arg) {
+static void subbatch_pool_worker(void *arg) {
     subbatch_fine_ws_t *ws = (subbatch_fine_ws_t *)arg;
     while (1) {
         int idx = __sync_fetch_and_add(ws->next_task, 1);
@@ -116,10 +112,9 @@ static void *_subbatch_worker_fine(void *arg) {
                   t->src + t->sub_offset,
                   t->sub_size, ws->mode);
     }
-    return NULL;
 }
 
-/* Copy one sub-batch using fine-grained work-stealing. */
+/* Copy one sub-batch using persistent thread pool. */
 static void copy_subbatch(
     const void *base,
     const int64_t *offsets,
@@ -127,9 +122,11 @@ static void copy_subbatch(
     const int64_t *sizes,
     int start, int end,
     int max_threads, int mode,
-    pthread_t *threads  /* pre-allocated thread array */
+    pthread_t *threads  /* unused (kept for API compatibility) */
 ) {
-    /* Build fine-grained task list (1 MB sub-tasks) */
+    (void)threads;
+
+    /* Build fine-grained task list */
     int total_sub = 0;
     for (int i = start; i < end; i++)
         total_sub += ((size_t)sizes[i] + PIPELINE_SUB_TASK_SIZE - 1) / PIPELINE_SUB_TASK_SIZE;
@@ -157,17 +154,14 @@ static void copy_subbatch(
         }
     }
 
-    int nt = max_threads < total_sub ? max_threads : total_sub;
     volatile int next_task = 0;
     subbatch_fine_ws_t ws = {
         .tasks = tasks, .next_task = &next_task,
         .count = total_sub, .mode = mode
     };
 
-    for (int i = 0; i < nt; i++)
-        pthread_create(&threads[i], NULL, _subbatch_worker_fine, &ws);
-    for (int i = 0; i < nt; i++)
-        pthread_join(threads[i], NULL);
+    thread_pool_t *pool = thread_pool_get(max_threads);
+    thread_pool_parallel_for(pool, subbatch_pool_worker, &ws);
 
     free(tasks);
 }
