@@ -15,8 +15,24 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <time.h>
 #include <immintrin.h>
 #include <pthread.h>
+
+/* Profiling (same pattern as bar1_bridge.cu). Gated by LMCACHE_PROFILE=1. */
+static int g_profile_enabled = -1;
+static inline int profile_enabled(void) {
+    if (__builtin_expect(g_profile_enabled < 0, 0)) {
+        const char *e = getenv("LMCACHE_PROFILE");
+        g_profile_enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return g_profile_enabled;
+}
+static inline double prof_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
 
 /* Import memcpy variants (same as fast_read.c) */
 static void avx512_memcpy_nt(void *dst, const void *src, size_t n) {
@@ -208,20 +224,32 @@ int pipeline_double_buffer(
     gpu_cb_arg_t gpu_arg;
     int gpu_running = 0;
 
+    int profile = profile_enabled();
+    double p_entry = profile ? prof_now_ms() : 0;
+    double acc_disk_ms = 0, acc_wait_prev_ms = 0, acc_cb_issue_ms = 0;
+    int n_batches = 0;
+    size_t total_bytes = 0;
+
     int batch_idx = 0;
     for (int start = 0; start < count; start += batch_size) {
         int end = start + batch_size;
         if (end > count) end = count;
 
+        double t0 = profile ? prof_now_ms() : 0;
+
         /* Copy this sub-batch */
         copy_subbatch(base, offsets, dsts, sizes,
                       start, end, max_threads, mode, threads);
+
+        double t1 = profile ? prof_now_ms() : 0;
 
         /* Wait for previous GPU transfer to complete */
         if (gpu_running) {
             pthread_join(gpu_thread, NULL);
             gpu_running = 0;
         }
+
+        double t2 = profile ? prof_now_ms() : 0;
 
         /* Start GPU transfer for this sub-batch in background */
         if (callback) {
@@ -233,12 +261,38 @@ int pipeline_double_buffer(
             gpu_running = 1;
         }
 
+        double t3 = profile ? prof_now_ms() : 0;
+
+        if (profile) {
+            acc_disk_ms += t1 - t0;
+            acc_wait_prev_ms += t2 - t1;
+            acc_cb_issue_ms += t3 - t2;
+            n_batches++;
+            for (int j = start; j < end; j++) total_bytes += (size_t)sizes[j];
+        }
+
         batch_idx++;
     }
 
     /* Wait for last GPU transfer */
+    double t_final_wait_start = profile ? prof_now_ms() : 0;
     if (gpu_running)
         pthread_join(gpu_thread, NULL);
+    double t_final_wait_end = profile ? prof_now_ms() : 0;
+
+    if (profile) {
+        double total_ms = t_final_wait_end - p_entry;
+        double total_gb = (double)total_bytes / (1024.0*1024.0*1024.0);
+        double agg_bw = total_ms > 0 ? total_gb / (total_ms / 1000.0) : 0;
+        fprintf(stderr,
+                "[PROF pipeline_double_buffer] n=%d nt=%d batch=%d n_sub=%d | "
+                "disk_total=%.2fms wait_prev_total=%.2fms cb_issue_total=%.2fms "
+                "final_wait=%.2fms walltime=%.2fms | %.2f GB @ %.2f GB/s\n",
+                count, max_threads, batch_size, n_batches,
+                acc_disk_ms, acc_wait_prev_ms, acc_cb_issue_ms,
+                t_final_wait_end - t_final_wait_start,
+                total_ms, total_gb, agg_bw);
+    }
 
     free(threads);
     return 0;

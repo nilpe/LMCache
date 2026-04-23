@@ -17,9 +17,33 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <pthread.h>
 
 #define GPU_PAGE (64UL * 1024)
+
+/* ============================================================
+ * Profiling infrastructure (enabled via LMCACHE_PROFILE=1 env var).
+ * When disabled the instrumentation is a single branch per call.
+ * ============================================================ */
+static int g_profile_enabled = -1;
+static inline int profile_enabled(void) {
+    if (__builtin_expect(g_profile_enabled < 0, 0)) {
+        const char *e = getenv("LMCACHE_PROFILE");
+        g_profile_enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return g_profile_enabled;
+}
+static inline double prof_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+static inline void prof_stats(double *arr, int n, double *mn, double *mx, double *mean) {
+    double s = 0, lo = arr[0], hi = arr[0];
+    for (int i = 0; i < n; i++) { s += arr[i]; if (arr[i] < lo) lo = arr[i]; if (arr[i] > hi) hi = arr[i]; }
+    *mn = lo; *mx = hi; *mean = s / n;
+}
 
 /* ============================================================
  * Global state (one staging buffer per process)
@@ -254,6 +278,36 @@ typedef struct {
     int count;
 } fine_ws_arg_t;
 
+/* Per-thread profile slot (only used when profile_enabled) */
+typedef struct {
+    fine_ws_arg_t *ws;
+    int tid;
+    double t_first_ms, t_last_ms, work_acc_ms;
+    size_t bytes_acc;
+    int tasks_done;
+} fine_ws_thread_arg_t;
+
+static void *fine_ws_worker_profiled(void *arg) {
+    fine_ws_thread_arg_t *a = (fine_ws_thread_arg_t *)arg;
+    fine_ws_arg_t *ws = a->ws;
+    while (1) {
+        int idx = __sync_fetch_and_add(ws->next_task, 1);
+        if (idx >= ws->count) break;
+        fine_task_t *t = &ws->tasks[idx];
+        double ts = prof_now_ms();
+        if (a->tasks_done == 0) a->t_first_ms = ts;
+        avx512_nt_copy(t->dst_base + t->sub_offset,
+                       t->src_base + t->sub_offset,
+                       t->sub_size);
+        double te = prof_now_ms();
+        a->work_acc_ms += te - ts;
+        a->bytes_acc += t->sub_size;
+        a->t_last_ms = te;
+        a->tasks_done++;
+    }
+    return NULL;
+}
+
 static void *fine_ws_worker(void *arg) {
     fine_ws_arg_t *ws = (fine_ws_arg_t *)arg;
     while (1) {
@@ -276,6 +330,8 @@ int bar1_copy_scatter(
     int max_threads
 ) {
     if (!g_initialized) return -1;
+    int profile = profile_enabled();
+    double p_entry = profile ? prof_now_ms() : 0;
 
     /* Build fine-grained task list */
     int total_tasks = 0;
@@ -308,14 +364,66 @@ int bar1_copy_scatter(
     int nt = max_threads;
     if (nt > total_tasks) nt = total_tasks;
 
+    double p_build = profile ? prof_now_ms() : 0;
+
     pthread_t *threads = (pthread_t *)malloc(nt * sizeof(pthread_t));
     volatile int next = 0;
     fine_ws_arg_t ws = { .tasks = tasks, .next_task = &next, .count = total_tasks };
 
-    for (int i = 0; i < nt; i++)
-        pthread_create(&threads[i], NULL, fine_ws_worker, &ws);
-    for (int i = 0; i < nt; i++)
-        pthread_join(threads[i], NULL);
+    if (profile) {
+        fine_ws_thread_arg_t *targs = (fine_ws_thread_arg_t *)calloc(nt, sizeof(fine_ws_thread_arg_t));
+        for (int i = 0; i < nt; i++) { targs[i].ws = &ws; targs[i].tid = i; }
+
+        double p_create_start = prof_now_ms();
+        for (int i = 0; i < nt; i++)
+            pthread_create(&threads[i], NULL, fine_ws_worker_profiled, &targs[i]);
+        double p_create_end = prof_now_ms();
+
+        for (int i = 0; i < nt; i++)
+            pthread_join(threads[i], NULL);
+        double p_join = prof_now_ms();
+
+        /* Aggregate per-thread stats */
+        double work_min = targs[0].work_acc_ms, work_max = targs[0].work_acc_ms, work_sum = 0;
+        double first_min = targs[0].t_first_ms, last_max = targs[0].t_last_ms;
+        size_t bytes_sum = 0;
+        int tasks_min = targs[0].tasks_done, tasks_max = targs[0].tasks_done;
+        for (int i = 0; i < nt; i++) {
+            double w = targs[i].work_acc_ms;
+            if (w < work_min) work_min = w;
+            if (w > work_max) work_max = w;
+            work_sum += w;
+            bytes_sum += targs[i].bytes_acc;
+            if (targs[i].t_first_ms < first_min && targs[i].tasks_done > 0) first_min = targs[i].t_first_ms;
+            if (targs[i].t_last_ms  > last_max) last_max  = targs[i].t_last_ms;
+            if (targs[i].tasks_done < tasks_min) tasks_min = targs[i].tasks_done;
+            if (targs[i].tasks_done > tasks_max) tasks_max = targs[i].tasks_done;
+        }
+        double work_mean = work_sum / nt;
+        double total_bytes_gb = (double)bytes_sum / (1024.0*1024.0*1024.0);
+        double span_ms = last_max - first_min;
+        double agg_bw = span_ms > 0 ? total_bytes_gb / (span_ms / 1000.0) : 0;
+
+        fprintf(stderr,
+                "[PROF bar1_copy_scatter] n=%d nt=%d total_tasks=%d | "
+                "build=%.3fms create=%.3fms work_span=%.3fms join_after=%.3fms | "
+                "per_thread_work(ms): min=%.2f mean=%.2f max=%.2f | "
+                "tasks_per_thread min=%d max=%d | agg=%.2f GB @ %.2f GB/s\n",
+                count, nt, total_tasks,
+                p_build - p_entry,
+                p_create_end - p_create_start,
+                span_ms,
+                p_join - p_create_end,
+                work_min, work_mean, work_max,
+                tasks_min, tasks_max,
+                total_bytes_gb, agg_bw);
+        free(targs);
+    } else {
+        for (int i = 0; i < nt; i++)
+            pthread_create(&threads[i], NULL, fine_ws_worker, &ws);
+        for (int i = 0; i < nt; i++)
+            pthread_join(threads[i], NULL);
+    }
 
     free(threads);
     free(tasks);
@@ -603,6 +711,12 @@ typedef struct {
     int count;
     int thread_id;
     CUcontext ctx;
+    /* profiling (only valid if global profile enabled) */
+    double prof_first_ms;
+    double prof_last_ms;
+    double prof_issue_acc_ms;   /* cumulative cudaMemcpyAsync call time */
+    size_t prof_bytes;
+    int    prof_tasks_done;
 } gpu_dma_arg_t;
 
 static void *gpu_dma_worker(void *arg) {
@@ -610,6 +724,7 @@ static void *gpu_dma_worker(void *arg) {
     if (a->ctx) cuCtxSetCurrent(a->ctx);
     cudaSetDevice(0);
     cudaStream_t stream = g_gpu_dma_streams[a->thread_id % g_gpu_dma_num_streams];
+    int profile = profile_enabled();
 
     while (1) {
         int idx = __sync_fetch_and_add(a->next_task, 1);
@@ -617,7 +732,18 @@ static void *gpu_dma_worker(void *arg) {
         const char *src = (const char *)g_gpu_dma_pmem_dev + a->pmem_offsets[idx];
         char *dst = (char *)a->gpu_dst_base + a->gpu_offsets[idx];
         size_t sz = (size_t)a->sizes[idx];
-        cudaMemcpyAsync(dst, src, sz, cudaMemcpyHostToDevice, stream);
+        if (profile) {
+            double ts = prof_now_ms();
+            if (a->prof_tasks_done == 0) a->prof_first_ms = ts;
+            cudaMemcpyAsync(dst, src, sz, cudaMemcpyHostToDevice, stream);
+            double te = prof_now_ms();
+            a->prof_issue_acc_ms += te - ts;
+            a->prof_bytes += sz;
+            a->prof_last_ms = te;
+            a->prof_tasks_done++;
+        } else {
+            cudaMemcpyAsync(dst, src, sz, cudaMemcpyHostToDevice, stream);
+        }
     }
     return NULL;
 }
@@ -646,13 +772,17 @@ int parallel_gpu_dma_chunked(
     if (nt > count) nt = count;
     if (nt < 1) nt = 1;
 
+    int profile = profile_enabled();
+    double p_entry = profile ? prof_now_ms() : 0;
+
     pthread_t *threads = (pthread_t *)malloc(nt * sizeof(pthread_t));
-    gpu_dma_arg_t *args = (gpu_dma_arg_t *)malloc(nt * sizeof(gpu_dma_arg_t));
+    gpu_dma_arg_t *args = (gpu_dma_arg_t *)calloc(nt, sizeof(gpu_dma_arg_t));
     volatile int next = 0;
 
     CUcontext ctx = NULL;
     cuCtxGetCurrent(&ctx);
 
+    double p_create_start = profile ? prof_now_ms() : 0;
     for (int i = 0; i < nt; i++) {
         args[i].gpu_dst_base = gpu_dst_base;
         args[i].pmem_offsets = pmem_offsets;
@@ -664,11 +794,49 @@ int parallel_gpu_dma_chunked(
         args[i].ctx = ctx;
         pthread_create(&threads[i], NULL, gpu_dma_worker, &args[i]);
     }
+    double p_create_end = profile ? prof_now_ms() : 0;
+
     for (int i = 0; i < nt; i++)
         pthread_join(threads[i], NULL);
+    double p_join = profile ? prof_now_ms() : 0;
 
     for (int i = 0; i < g_gpu_dma_num_streams; i++)
         cudaStreamSynchronize(g_gpu_dma_streams[i]);
+    double p_sync = profile ? prof_now_ms() : 0;
+
+    if (profile) {
+        double issue_sum = 0, issue_min = args[0].prof_issue_acc_ms, issue_max = args[0].prof_issue_acc_ms;
+        double first_min = 1e18, last_max = 0;
+        size_t bytes_sum = 0;
+        int tasks_min = args[0].prof_tasks_done, tasks_max = args[0].prof_tasks_done;
+        for (int i = 0; i < nt; i++) {
+            issue_sum += args[i].prof_issue_acc_ms;
+            if (args[i].prof_issue_acc_ms < issue_min) issue_min = args[i].prof_issue_acc_ms;
+            if (args[i].prof_issue_acc_ms > issue_max) issue_max = args[i].prof_issue_acc_ms;
+            if (args[i].prof_tasks_done > 0 && args[i].prof_first_ms < first_min)
+                first_min = args[i].prof_first_ms;
+            if (args[i].prof_last_ms > last_max) last_max = args[i].prof_last_ms;
+            bytes_sum += args[i].prof_bytes;
+            if (args[i].prof_tasks_done < tasks_min) tasks_min = args[i].prof_tasks_done;
+            if (args[i].prof_tasks_done > tasks_max) tasks_max = args[i].prof_tasks_done;
+        }
+        double total_gb = (double)bytes_sum / (1024.0*1024.0*1024.0);
+        double dma_span = p_sync - p_create_start;
+        double dma_bw = dma_span > 0 ? total_gb / (dma_span / 1000.0) : 0;
+        fprintf(stderr,
+                "[PROF gpu_dma_chunked] n=%d nt=%d | "
+                "create=%.3fms join=%.3fms sync=%.3fms total=%.3fms | "
+                "per_thread_issue(ms): min=%.3f mean=%.3f max=%.3f | "
+                "tasks_per_thread min=%d max=%d | %.2f GB @ %.2f GB/s\n",
+                count, nt,
+                p_create_end - p_create_start,
+                p_join - p_create_end,
+                p_sync - p_join,
+                p_sync - p_entry,
+                issue_min, issue_sum / nt, issue_max,
+                tasks_min, tasks_max,
+                total_gb, dma_bw);
+    }
 
     free(threads);
     free(args);
