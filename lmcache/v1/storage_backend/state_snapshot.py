@@ -35,7 +35,11 @@ _DEFAULT_DUMP_DIR = "/tmp/lmcache_snapshot"
 def _get_dump_path() -> Path:
     d = Path(os.environ.get("LMCACHE_DUMP_PATH", _DEFAULT_DUMP_DIR))
     d.mkdir(parents=True, exist_ok=True)
-    # ホスト名を含めて 4 ランクが同一ディレクトリに書いても衝突しない
+    # Rank ベースで識別 (ノード再割当されてもランクごとの cache が正しく対応)。
+    # LMCACHE_RANK_ID が無い場合は hostname フォールバック (レガシー互換 & 単一ランク環境)。
+    rank_id = os.environ.get("LMCACHE_RANK_ID")
+    if rank_id is not None:
+        return d / f"lmcache_state_rank{rank_id}.pkl"
     import socket
     hostname = socket.gethostname()
     return d / f"lmcache_state_{hostname}.pkl"
@@ -102,8 +106,17 @@ def load_backend_state(backend) -> int:
 
     dump_path = _get_dump_path()
     if not dump_path.exists():
-        # フォールバック: 同一ディレクトリ内の任意の pkl
         d = dump_path.parent
+        # LMCACHE_RANK_ID が設定されている場合は rank pkl 未存在を致命エラーに
+        # (他ランクの pkl を誤読すると session 割当不一致で retrieve が MISS になる)
+        if os.environ.get("LMCACHE_RANK_ID") is not None:
+            available = sorted(p.name for p in d.glob("lmcache_state_*.pkl"))
+            logger.warning(
+                f"Rank snapshot not found: {dump_path.name} in {d}. "
+                f"Available pkls: {available}. Starting with empty cache."
+            )
+            return 0
+        # レガシー hostname モードのみ: 任意 pkl fallback (1-rank 環境を想定)
         pkls = sorted(d.glob("lmcache_state_*.pkl"))
         if pkls:
             dump_path = pkls[0]
