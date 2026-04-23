@@ -1,0 +1,13 @@
+[package]
+name = "lmcache-fast-read"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "lmcache_fast_read"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.24", features = ["extension-module"] }
+rayon = "1.10"
+memmap2 = "0.9"

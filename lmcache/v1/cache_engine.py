@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 import asyncio
 import gc
 import multiprocessing
+import os
 import time
 
 # Third Party
@@ -810,7 +811,489 @@ class LMCacheEngine:
         ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
 
         reordered_chunks: List[ProcessedChunk] = []
-        if not self._is_passive():
+        pipeline_batch = (
+            self.config.extra_config.get("pipeline_retrieve_batch", 0)
+            if self.config.extra_config else 0
+        )
+        use_native_pipeline = (
+            self.config.extra_config.get("native_pipeline", False)
+            if self.config.extra_config else False
+        )
+        use_bar1 = (
+            self.config.extra_config.get("use_bar1", False)
+            if self.config.extra_config else False
+        )
+        use_h2d = (
+            self.config.extra_config.get("use_h2d_per_thread", False)
+            if self.config.extra_config else False
+        )
+        use_gpu_dma = (
+            self.config.extra_config.get("use_gpu_dma_direct", False)
+            if self.config.extra_config else False
+        )
+
+        if not self._is_passive() and os.environ.get("LMCACHE_SKIP_TRANSFER"):
+            _t0 = time.perf_counter()
+
+            with retrieve_stats.profile_process_tokens():
+                request_configs = kwargs.get("request_configs")
+                chunk_infos = []
+
+                _t1 = time.perf_counter()
+                for start, end, key in self.token_database.process_tokens(
+                    tokens=tokens, mask=mask, request_configs=request_configs,
+                ):
+                    chunk_infos.append((key, start, end))
+                _t2 = time.perf_counter()
+
+                block_mapping = self.storage_manager.get_block_mapping(
+                    chunk_infos)
+                _t3 = time.perf_counter()
+
+                for location, blocks in block_mapping.items():
+                    for key, start, end in blocks:
+                        ret_mask[start:end] = True
+                        tot_kv_size += (end - start)
+                _t4 = time.perf_counter()
+
+            retrieved_tokens = torch.sum(ret_mask)
+            self.stats_monitor.on_retrieve_finished(
+                retrieve_stats, retrieved_tokens)
+            _t5 = time.perf_counter()
+            logger.info(
+                "[req_id=%s] SKIP_TRANSFER: Retrieved %d/%d tokens. "
+                "process_tokens=%.3fms get_block_mapping=%.3fms "
+                "set_mask=%.3fms stats=%.3fms total=%.3fms",
+                req_id, retrieved_tokens, num_required_tokens,
+                (_t2 - _t1) * 1000,
+                (_t3 - _t2) * 1000,
+                (_t4 - _t3) * 1000,
+                (_t5 - _t4) * 1000,
+                (_t5 - _t0) * 1000,
+            )
+            return ret_mask
+
+        elif not self._is_passive() and use_gpu_dma:
+            # GPU DMA direct: cudaHostRegister(PMEM) + cudaMemcpyAsync → GPU staging
+            # GPU copy engine pulls PMEM directly; no CPU staging
+            import time as _time
+
+            with retrieve_stats.profile_process_tokens():
+                assert self.storage_manager is not None
+                tot_kv_size = 0
+                request_configs = kwargs.get("request_configs")
+
+                chunk_infos = []
+                for start, end, key in self.token_database.process_tokens(
+                    tokens=tokens, mask=mask, request_configs=request_configs,
+                ):
+                    chunk_infos.append((key, start, end))
+
+                block_mapping = self.storage_manager.get_block_mapping(chunk_infos)
+                all_blocks = []
+                for location, blocks in block_mapping.items():
+                    all_blocks.append((location, blocks))
+
+            t_gpd_start = _time.perf_counter()
+
+            with retrieve_stats.profile_to_gpu():
+                for location, blocks in all_blocks:
+                    all_keys = [key for key, _, _ in blocks]
+
+                    backend = None
+                    for name, sb in self.storage_manager.get_active_storage_backends(location):
+                        if hasattr(sb, "gpu_dma_batched_get"):
+                            backend = sb
+                            break
+
+                    if backend is None:
+                        raise RuntimeError(
+                            "use_gpu_dma_direct=true but no backend "
+                            f"with gpu_dma_batched_get at location {location}"
+                        )
+
+                    result = backend.gpu_dma_batched_get(all_keys)
+                    if result is None:
+                        raise RuntimeError(
+                            "gpu_dma_batched_get returned None "
+                            f"for {len(all_keys)} keys at {location}"
+                        )
+
+                    staging = result["staging_tensor"]
+                    valid = result["valid"]
+
+                    sub_mos = []
+                    sub_starts = []
+                    sub_ends = []
+
+                    for i, (key, offset, dtype, shape, fmt, cpos) in enumerate(valid):
+                        byte_offset = result["gpu_offsets"][i]
+                        byte_size = result["sizes"][i]
+
+                        gpu_chunk = staging[byte_offset:byte_offset + byte_size]
+
+                        mo = backend.local_cpu_backend.allocate(shape, dtype, fmt)
+                        if mo is None:
+                            continue
+                        mo.raw_data = gpu_chunk
+                        mo.metadata.cached_positions = cpos
+
+                        orig_key, orig_start, orig_end = blocks[i]
+                        reordered_chunks.append((key, mo, orig_start, orig_end))
+                        sub_mos.append(mo)
+                        sub_starts.append(orig_start)
+                        sub_ends.append(orig_end)
+                        tot_kv_size += byte_size
+                        ret_mask[orig_start:orig_end] = True
+
+                    if sub_mos:
+                        self.gpu_connector.batched_to_gpu(
+                            sub_mos, sub_starts, sub_ends, **kwargs
+                        )
+
+            t_gpd_end = _time.perf_counter()
+            logger.info(
+                f"GPU_DMA retrieve: {len(reordered_chunks)} chunks, "
+                f"total={((t_gpd_end - t_gpd_start) * 1000):.1f}ms"
+            )
+
+        elif not self._is_passive() and use_h2d:
+            # Per-thread H2D: PMEM → pinned DRAM → cudaMemcpyAsync → GPU staging
+            import time as _time
+
+            with retrieve_stats.profile_process_tokens():
+                assert self.storage_manager is not None
+                tot_kv_size = 0
+                request_configs = kwargs.get("request_configs")
+
+                chunk_infos = []
+                for start, end, key in self.token_database.process_tokens(
+                    tokens=tokens, mask=mask, request_configs=request_configs,
+                ):
+                    chunk_infos.append((key, start, end))
+
+                block_mapping = self.storage_manager.get_block_mapping(chunk_infos)
+                all_blocks = []
+                for location, blocks in block_mapping.items():
+                    all_blocks.append((location, blocks))
+
+            t_h2d_start = _time.perf_counter()
+
+            with retrieve_stats.profile_to_gpu():
+                for location, blocks in all_blocks:
+                    all_keys = [key for key, _, _ in blocks]
+
+                    backend = None
+                    for name, sb in self.storage_manager.get_active_storage_backends(location):
+                        if hasattr(sb, "h2d_batched_get"):
+                            backend = sb
+                            break
+
+                    if backend is None:
+                        logger.warning("No H2D backend, falling back")
+                        break
+
+                    result = backend.h2d_batched_get(all_keys)
+                    if result is None:
+                        break
+
+                    staging = result["staging_tensor"]
+                    valid = result["valid"]
+
+                    sub_mos = []
+                    sub_starts = []
+                    sub_ends = []
+
+                    for i, (key, offset, dtype, shape, fmt, cpos) in enumerate(valid):
+                        byte_offset = result["gpu_offsets"][i]
+                        byte_size = result["sizes"][i]
+
+                        gpu_chunk = staging[byte_offset:byte_offset + byte_size]
+
+                        mo = backend.local_cpu_backend.allocate(shape, dtype, fmt)
+                        if mo is None:
+                            continue
+                        mo.raw_data = gpu_chunk
+                        mo.metadata.cached_positions = cpos
+
+                        orig_key, orig_start, orig_end = blocks[i]
+                        reordered_chunks.append((key, mo, orig_start, orig_end))
+                        sub_mos.append(mo)
+                        sub_starts.append(orig_start)
+                        sub_ends.append(orig_end)
+                        tot_kv_size += byte_size
+                        ret_mask[orig_start:orig_end] = True
+
+                    if sub_mos:
+                        self.gpu_connector.batched_to_gpu(
+                            sub_mos, sub_starts, sub_ends, **kwargs
+                        )
+
+            t_h2d_end = _time.perf_counter()
+            logger.info(
+                f"H2D retrieve: {len(reordered_chunks)} chunks, "
+                f"total={((t_h2d_end - t_h2d_start) * 1000):.1f}ms"
+            )
+
+        elif not self._is_passive() and use_bar1:
+            # BAR1 direct: PMEM → GPU BAR1 → KV cache (DRAM bypass)
+            import time as _time
+
+            with retrieve_stats.profile_process_tokens():
+                assert self.storage_manager is not None
+                tot_kv_size = 0
+                request_configs = kwargs.get("request_configs")
+
+                chunk_infos = []
+                for start, end, key in self.token_database.process_tokens(
+                    tokens=tokens, mask=mask, request_configs=request_configs,
+                ):
+                    chunk_infos.append((key, start, end))
+
+                block_mapping = self.storage_manager.get_block_mapping(chunk_infos)
+                all_blocks = []
+                for location, blocks in block_mapping.items():
+                    all_blocks.append((location, blocks))
+
+            t_bar1_start = _time.perf_counter()
+
+            with retrieve_stats.profile_to_gpu():
+                for location, blocks in all_blocks:
+                    all_keys = [key for key, _, _ in blocks]
+
+                    # Find DevDaxBackend with BAR1 support
+                    backend = None
+                    for name, sb in self.storage_manager.get_active_storage_backends(location):
+                        if hasattr(sb, 'bar1_batched_get'):
+                            backend = sb
+                            break
+
+                    if backend is None:
+                        logger.warning("No BAR1 backend, falling back")
+                        break
+
+                    # Step 1: PMEM → GPU BAR1 (AVX-512 NT store, zero-copy)
+                    result = backend.bar1_batched_get(all_keys)
+                    if result is None:
+                        break
+
+                    # Step 2: Zero-copy tensor views of staging buffer
+                    # staging_tensor is a PyTorch GPU tensor. We create views
+                    # into it for each chunk — NO D2D memcpy, NO per-chunk alloc.
+                    staging = result["staging_tensor"]
+                    valid = result["valid"]
+
+                    sub_mos = []
+                    sub_starts = []
+                    sub_ends = []
+
+                    for i, (key, offset, dtype, shape, fmt, cpos) in enumerate(valid):
+                        byte_offset = result["gpu_offsets"][i]
+                        byte_size = result["sizes"][i]
+                        numel = 1
+                        for s in shape:
+                            numel *= s
+
+                        # Zero-copy view: slice staging tensor → GPU tensor
+                        gpu_chunk = staging[byte_offset:byte_offset + byte_size]
+
+                        # Create MemoryObj then replace raw_data with GPU view
+                        mo = backend.local_cpu_backend.allocate(shape, dtype, fmt)
+                        if mo is None:
+                            continue
+                        # Replace CPU raw_data with GPU staging view (zero-copy)
+                        mo.raw_data = gpu_chunk
+                        mo.metadata.cached_positions = cpos
+
+                        orig_key, orig_start, orig_end = blocks[i]
+                        reordered_chunks.append((key, mo, orig_start, orig_end))
+                        sub_mos.append(mo)
+                        sub_starts.append(orig_start)
+                        sub_ends.append(orig_end)
+                        tot_kv_size += byte_size
+                        ret_mask[orig_start:orig_end] = True
+
+                    # batched_to_gpu: tensor is on GPU → reads from HBM (~3 TB/s)
+                    # instead of PCIe (~32 GB/s). Reshape kernel only.
+                    if sub_mos:
+                        self.gpu_connector.batched_to_gpu(
+                            sub_mos, sub_starts, sub_ends, **kwargs
+                        )
+
+            t_bar1_end = _time.perf_counter()
+            logger.info(
+                f"BAR1 retrieve: {len(reordered_chunks)} chunks, "
+                f"total={((t_bar1_end - t_bar1_start) * 1000):.1f}ms"
+            )
+
+        elif not self._is_passive() and pipeline_batch > 0 and use_native_pipeline:
+            # Native C pipeline: Python ループゼロ
+            import time as _time
+
+            with retrieve_stats.profile_process_tokens():
+                assert self.storage_manager is not None
+                tot_kv_size = 0
+                request_configs = kwargs.get("request_configs")
+
+                chunk_infos = []
+                for start, end, key in self.token_database.process_tokens(
+                    tokens=tokens, mask=mask, request_configs=request_configs,
+                ):
+                    chunk_infos.append((key, start, end))
+
+                block_mapping = self.storage_manager.get_block_mapping(chunk_infos)
+                all_blocks = []
+                for location, blocks in block_mapping.items():
+                    all_blocks.append((location, blocks))
+
+            t_pipeline_start = _time.perf_counter()
+
+            with retrieve_stats.profile_to_gpu():
+                for location, blocks in all_blocks:
+                    all_keys = [key for key, _, _ in blocks]
+
+                    # GPU callback: called from C pthread after each sub-batch
+                    # Must enter InferenceMode since we're outside PyTorch context
+                    def _gpu_callback(batch_idx, sub_objs, sub_valid):
+                        with torch.inference_mode():
+                            sub_chunks = []
+                            for (idx, (key, offset, dtype, shape, fmt)), mo in zip(
+                                sub_valid, sub_objs
+                            ):
+                                orig_key, orig_start, orig_end = blocks[idx]
+                                sub_chunks.append((key, mo, orig_start, orig_end))
+                                reordered_chunks.append((key, mo, orig_start, orig_end))
+                                nonlocal tot_kv_size
+                                tot_kv_size += mo.get_size()
+                                ret_mask[orig_start:orig_end] = True
+
+                            if sub_chunks:
+                                _, mem_objs, sts, eds = zip(*sub_chunks, strict=False)
+                                self.gpu_connector.batched_to_gpu(
+                                    list(mem_objs), list(sts), list(eds), **kwargs
+                                )
+
+                    # Get the DevDaxBackend from storage_manager
+                    backend = None
+                    for name, sb in self.storage_manager.get_active_storage_backends(location):
+                        if hasattr(sb, 'pipeline_get_blocking'):
+                            backend = sb
+                            break
+                    if backend is not None:
+                        backend.pipeline_get_blocking(
+                            all_keys, pipeline_batch, _gpu_callback,
+                        )
+                    else:
+                        logger.warning("No backend with pipeline_get_blocking, "
+                                       "falling back to Python pipeline")
+
+            t_pipeline_end = _time.perf_counter()
+            logger.info(
+                f"Native pipeline: {len(reordered_chunks)} chunks, "
+                f"batch_size={pipeline_batch}, "
+                f"total={( t_pipeline_end - t_pipeline_start) * 1000:.1f}ms"
+            )
+
+        elif not self._is_passive() and pipeline_batch > 0:
+            # Pipelined retrieve: batched_get のサブバッチ完了後に
+            # 即座に GPU 転送を非同期開始し、次のサブバッチの batched_get を並行実行
+            import concurrent.futures
+            import time as _time
+
+            with retrieve_stats.profile_process_tokens():
+                assert self.storage_manager is not None
+                tot_kv_size = 0
+                request_configs = kwargs.get("request_configs")
+
+                chunk_infos = []
+                for start, end, key in self.token_database.process_tokens(
+                    tokens=tokens, mask=mask, request_configs=request_configs,
+                ):
+                    chunk_infos.append((key, start, end))
+
+                block_mapping = self.storage_manager.get_block_mapping(chunk_infos)
+
+                # Flatten all blocks
+                all_blocks = []
+                for location, blocks in block_mapping.items():
+                    all_blocks.append((location, blocks))
+
+            t_pipeline_start = _time.perf_counter()
+
+            with retrieve_stats.profile_to_gpu():
+                # True double-buffering: disk[i+1] overlaps with gpu[i]
+                disk_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                gpu_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                gpu_future = None
+
+                for location, blocks in all_blocks:
+                    sub_batches = []
+                    for i in range(0, len(blocks), pipeline_batch):
+                        sub_batches.append(blocks[i:i + pipeline_batch])
+
+                    # Pre-submit first disk read
+                    disk_future = None
+                    if sub_batches:
+                        first_keys = [key for key, _, _ in sub_batches[0]]
+                        disk_future = disk_executor.submit(
+                            self.storage_manager.batched_get,
+                            keys=first_keys, location=location,
+                        )
+
+                    for bi, sub_blocks in enumerate(sub_batches):
+                        # Wait for current disk read
+                        memory_objs = disk_future.result()
+
+                        # Submit next disk read immediately (overlap with GPU)
+                        next_disk_future = None
+                        if bi + 1 < len(sub_batches):
+                            next_keys = [key for key, _, _ in sub_batches[bi + 1]]
+                            next_disk_future = disk_executor.submit(
+                                self.storage_manager.batched_get,
+                                keys=next_keys, location=location,
+                            )
+
+                        # Wait for previous GPU transfer
+                        if gpu_future is not None:
+                            gpu_future.result()
+
+                        # Collect valid chunks
+                        sub_chunks = []
+                        for (key, start, end), memory_obj in zip(
+                            sub_blocks, memory_objs, strict=False
+                        ):
+                            if memory_obj is None:
+                                break
+                            sub_chunks.append((key, memory_obj, start, end))
+                            reordered_chunks.append((key, memory_obj, start, end))
+                            tot_kv_size += memory_obj.get_size()
+                            ret_mask[start:end] = True
+
+                        if sub_chunks:
+                            _, mem_objs, sts, eds = zip(*sub_chunks, strict=False)
+                            def _gpu_xfer(mo=list(mem_objs), s=list(sts),
+                                         e=list(eds), kw=kwargs):
+                                self.gpu_connector.batched_to_gpu(mo, s, e, **kw)
+                            gpu_future = gpu_executor.submit(_gpu_xfer)
+
+                        disk_future = next_disk_future
+
+                # Wait for last GPU transfer
+                if gpu_future is not None:
+                    gpu_future.result()
+                gpu_executor.shutdown(wait=False)
+                disk_executor.shutdown(wait=False)
+
+            t_pipeline_end = _time.perf_counter()
+            logger.info(
+                f"Pipelined retrieve: {len(reordered_chunks)} chunks, "
+                f"batch_size={pipeline_batch}, "
+                f"total={( t_pipeline_end - t_pipeline_start) * 1000:.1f}ms"
+            )
+
+        elif not self._is_passive():
+            _bw_profile = os.environ.get("LMCACHE_BW_PROFILE")
+
             with retrieve_stats.profile_process_tokens():
                 if self.async_loading:
                     reordered_chunks, tot_kv_size = self._async_process_tokens_internal(  # noqa: E501
@@ -827,33 +1310,40 @@ class LMCacheEngine:
                         **kwargs,
                     )
 
-        if self.save_only_first_rank:
-            with retrieve_stats.profile_broadcast():
-                with torch.cuda.stream(self.broadcast_stream):
-                    self._broadcast_or_receive_memory_objs(
-                        reordered_chunks,
-                        ret_mask,
+            if self.save_only_first_rank:
+                with retrieve_stats.profile_broadcast():
+                    with torch.cuda.stream(self.broadcast_stream):
+                        self._broadcast_or_receive_memory_objs(
+                            reordered_chunks,
+                            ret_mask,
+                        )
+                    if not hasattr(self.gpu_connector, "load_stream"):
+                        self.broadcast_stream.synchronize()
+
+            # NOTE(Jiayi): memory_obj doesn't have to be a pinned
+            # cpu tensor for the sake of performance.
+            if len(reordered_chunks) > 0:
+                if _bw_profile:
+                    import time as _time
+                    _t_disk_end = _time.perf_counter()  # disk read already done in _process_tokens_internal
+                _t_gpu_start = _time.perf_counter() if _bw_profile else 0
+
+                with retrieve_stats.profile_to_gpu():
+                    _, memory_objs, starts, ends = zip(*reordered_chunks, strict=False)
+                    self.gpu_connector.batched_to_gpu(
+                        list(memory_objs), list(starts), list(ends), **kwargs
                     )
 
-                # if self.gpu_connector has load_stream, self.broadcast_stream is equals
-                # to self.gpu_connector.load_stream, the broadcast and to_gpu operation
-                # will execute sequentially within the stream.
-                # if self.gpu_connector does not have load_stream, self.broadcast_stream
-                # is created by torch.cuda.Stream(), we need to synchronize broadcast
-                # operation, and then process to_cpu operation.
-                if not hasattr(self.gpu_connector, "load_stream"):
-                    self.broadcast_stream.synchronize()
-
-        # NOTE(Jiayi): memory_obj doesn't have to be a pinned
-        # cpu tensor for the sake of performance.
-        # For example, disk->gpu is faster than disk->cpu->gpu.
-        # RDMA is another example.
-        if len(reordered_chunks) > 0:
-            with retrieve_stats.profile_to_gpu():
-                _, memory_objs, starts, ends = zip(*reordered_chunks, strict=False)
-                self.gpu_connector.batched_to_gpu(
-                    list(memory_objs), list(starts), list(ends), **kwargs
-                )
+                if _bw_profile:
+                    _t_gpu_end = _time.perf_counter()
+                    _gpu_ms = (_t_gpu_end - _t_gpu_start) * 1000
+                    _gpu_bw = tot_kv_size / (_t_gpu_end - _t_gpu_start) / 1024**3 if (_t_gpu_end - _t_gpu_start) > 0 else 0
+                    logger.info(
+                        "[req_id=%s] BW_PROFILE: to_gpu %.3fms, "
+                        "size %.4f GB, bandwidth %.2f GB/s",
+                        req_id, _gpu_ms,
+                        tot_kv_size / 1024**3, _gpu_bw,
+                    )
 
         # TODO(Jiayi): Remove the following for loop with batched operations
         # TODO(Jiayi): Need to refactor the `remove_after_retrieve` logic.
@@ -1650,13 +2140,20 @@ class LMCacheEngine:
         else:
             block_mapping = self.storage_manager.get_block_mapping(chunk_infos)
 
+        _bw_profile = os.environ.get("LMCACHE_BW_PROFILE")
         last_failed_block_start = None
+        _disk_read_time = 0.0
         for location, blocks in block_mapping.items():
             keys = [key for key, _, _ in blocks]
+            if _bw_profile:
+                import time as _time
+                _t_disk_start = _time.perf_counter()
             memory_objs = self.storage_manager.batched_get(
                 keys=keys,
                 location=location,
             )
+            if _bw_profile:
+                _disk_read_time += _time.perf_counter() - _t_disk_start
 
             used_keys: set[CacheEngineKey] = set()
             for (key, start, end), memory_obj in zip(blocks, memory_objs, strict=False):
@@ -1705,6 +2202,17 @@ class LMCacheEngine:
                 for key, memory_obj, start, end in reordered_chunks
                 if end <= last_failed_block_start
             ]
+        if _bw_profile and _disk_read_time > 0 and tot_kv_size > 0:
+            _disk_bw = tot_kv_size / _disk_read_time / 1024**3
+            req_id = kwargs.get("req_id", "?")
+            logger.info(
+                "[req_id=%s] BW_PROFILE: disk_read %.3fms, "
+                "size %.4f GB, bandwidth %.2f GB/s, chunks %d",
+                req_id, _disk_read_time * 1000,
+                tot_kv_size / 1024**3, _disk_bw,
+                len(reordered_chunks),
+            )
+
         return reordered_chunks, tot_kv_size
 
     def _broadcast_or_receive_memory_objs(

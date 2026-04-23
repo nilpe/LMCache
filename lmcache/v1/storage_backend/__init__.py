@@ -197,7 +197,34 @@ def CreateStorageBackends(
         and "LocalDiskBackend" not in _skip
     ):
         assert local_cpu_backend is not None
-        local_disk_backend = LocalDiskBackend(
+
+        # Select disk backend variant based on extra_config
+        extra = config.extra_config or {}
+        disk_backend_type = extra.get("disk_backend_type", "default")
+        disk_backend_cls = LocalDiskBackend
+
+        if disk_backend_type == "threaded":
+            from lmcache.v1.storage_backend.threaded_disk_backend import (
+                ThreadedDiskBackend,
+            )
+            disk_backend_cls = ThreadedDiskBackend
+        elif disk_backend_type == "mmap":
+            from lmcache.v1.storage_backend.threaded_disk_backend import (
+                MmapDiskBackend,
+            )
+            disk_backend_cls = MmapDiskBackend
+        elif disk_backend_type == "threaded_mmap":
+            from lmcache.v1.storage_backend.threaded_disk_backend import (
+                ThreadedMmapDiskBackend,
+            )
+            disk_backend_cls = ThreadedMmapDiskBackend
+        elif disk_backend_type == "devdax":
+            from lmcache.v1.storage_backend.devdax_backend import (
+                DevDaxBackend,
+            )
+            disk_backend_cls = DevDaxBackend
+
+        local_disk_backend = disk_backend_cls(
             config,
             loop,
             local_cpu_backend,

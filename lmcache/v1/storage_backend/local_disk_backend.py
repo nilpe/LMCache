@@ -196,7 +196,7 @@ class LocalDiskBackend(StorageBackendInterface):
 
         # Re-hydrate self.dict from the sidecar JSONL so the disk tier
         # actually survives process restarts. No-op if the sidecar is
-        # absent (first time this path is used).
+        # absent (first time this path is used). [ralph]
         try:
             self._rehydrate_from_sidecar()
         except Exception as e:
@@ -204,6 +204,24 @@ class LocalDiskBackend(StorageBackendInterface):
                 "Disk-tier sidecar rehydrate failed (%r); cache starts empty",
                 e,
             )
+
+        # State snapshot: SIGUSR1 でメタデータダンプ、起動時に自動復元 [ykogi]
+        # ralph の sidecar JSONL と直交。両方走っても insert_key は冪等で
+        # self.dict にキーを重複登録しないので合算で生き残る。
+        from lmcache.v1.storage_backend.state_snapshot import (
+            register_backend_for_snapshot,
+            load_backend_state,
+        )
+        n = load_backend_state(self)
+        if n > 0:
+            self.current_cache_size = sum(
+                m.size for m in self.dict.values()
+            )
+            logger.info(
+                f"Restored {n} chunks from snapshot "
+                f"(cache_size={self.current_cache_size / (1024**3):.2f} GB)"
+            )
+        register_backend_for_snapshot(self)
 
     def __str__(self) -> str:
         return "LocalDiskBackend"
