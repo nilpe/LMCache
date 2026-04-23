@@ -84,6 +84,19 @@ def dump_backend_state(backend) -> Optional[str]:
     try:
         with open(dump_path, "wb") as f:
             pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+        # Also emit a plain-text side-car with alloc_offset (DevDAX only).
+        # Lets external tools locate the PMEM data without loading the pkl
+        # (which requires lmcache module in PYTHONPATH).
+        if "alloc_offset" in state:
+            rank_suffix = ""
+            rid = os.environ.get("LMCACHE_RANK_ID")
+            if rid is not None:
+                rank_suffix = f"_rank{rid}"
+            txt_path = dump_path.parent / f"alloc_offset{rank_suffix}.txt"
+            try:
+                txt_path.write_text(f"{state['alloc_offset']}\n")
+            except Exception as e:
+                logger.warning(f"alloc_offset sidecar write failed: {e}")
         n_chunks = len(state["dict"])
         logger.info(
             f"State dumped: {n_chunks} chunks → {dump_path} "
