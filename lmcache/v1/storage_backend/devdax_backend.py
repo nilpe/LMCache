@@ -184,6 +184,16 @@ class DevDaxBackend(StorageBackendInterface):
 
         extra = config.extra_config or {}
         self.devdax_path = extra.get("devdax_path", "/dev/dax0.0")
+        # Offset (in bytes) where this backend's slab starts inside the DAX
+        # device. Non-zero is used to split one DevDAX device across multiple
+        # LMCacheEngine instances (e.g. attention + Mamba sidecar). Must be a
+        # 2 MiB multiple so the mmap remains PMD-huge-page aligned.
+        self.devdax_offset = int(extra.get("devdax_offset", 0))
+        if self.devdax_offset < 0 or self.devdax_offset % (2 * 1024 * 1024) != 0:
+            raise ValueError(
+                f"devdax_offset must be a non-negative 2 MiB multiple; "
+                f"got 0x{self.devdax_offset:x}"
+            )
         copy_mode = extra.get("devdax_copy_mode", "avx512_nt")
         self.num_threads = extra.get("disk_read_threads", 8)
 
@@ -277,7 +287,13 @@ class DevDaxBackend(StorageBackendInterface):
                 pass
 
         max_size = int(config.max_local_disk_size * 1024**3)
-        self._map_size = min(max_size, dev_size)
+        available = dev_size - self.devdax_offset
+        if available <= 0:
+            raise ValueError(
+                f"devdax_offset 0x{self.devdax_offset:x} exceeds device size "
+                f"0x{dev_size:x} ({self.devdax_path})"
+            )
+        self._map_size = min(max_size, available)
         ALIGN = 2 * 1024 * 1024
         self._map_size = (self._map_size // ALIGN) * ALIGN
 
@@ -288,14 +304,14 @@ class DevDaxBackend(StorageBackendInterface):
 
         self._base = _libc.mmap(
             None, self._map_size, PROT_READ | PROT_WRITE,
-            MAP_SHARED_VALIDATE | MAP_SYNC, self._fd, 0
+            MAP_SHARED_VALIDATE | MAP_SYNC, self._fd, self.devdax_offset
         )
         if self._base == ctypes.c_void_p(-1).value:
             # Fallback to MAP_SHARED
             logger.warning("MAP_SYNC failed, falling back to MAP_SHARED")
             self._base = _libc.mmap(
                 None, self._map_size, PROT_READ | PROT_WRITE,
-                MAP_SHARED, self._fd, 0
+                MAP_SHARED, self._fd, self.devdax_offset
             )
         if self._base == ctypes.c_void_p(-1).value:
             raise RuntimeError(f"DevDAX mmap failed: {os.strerror(ctypes.get_errno())}")
@@ -331,7 +347,9 @@ class DevDaxBackend(StorageBackendInterface):
         self.keys_in_request: List[CacheEngineKey] = []
 
         logger.info(
-            f"DevDaxBackend: {self.devdax_path}, mapped {self._map_size / (1024**3):.1f} GB, "
+            f"DevDaxBackend: {self.devdax_path}"
+            f"[+{self.devdax_offset / (1024**3):.1f} GiB], "
+            f"mapped {self._map_size / (1024**3):.1f} GB, "
             f"copy_mode={copy_mode}({self._copy_mode}), threads={self.num_threads}"
         )
 
