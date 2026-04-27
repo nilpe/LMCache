@@ -97,6 +97,31 @@ class VllmServiceFactory(BaseServiceFactory):
         num_layer = model_config.get_num_layers(parallel_config)
         num_draft_layers = calculate_draft_layers(self.vllm_config)
         num_layer += num_draft_layers
+        # For hybrid models (Qwen3-Next, Qwen3.5/3.6, LFM2, ...) where the
+        # decoder interleaves full-attention and Mamba/GatedDeltaNet layers,
+        # LMCache only owns the attention KV. Counting Mamba layers in
+        # `num_layer` causes the GPU pointer array (sized to num_layer) to
+        # mismatch the attention-only `register_kv_caches()` payload at
+        # inference time. Detect hybrid by inspecting `layer_types` on the
+        # text config and override num_layer to the count of full-attention
+        # entries when present.
+        for cfg_attr in ("hf_text_config", "hf_config"):
+            cfg_obj = getattr(model_config, cfg_attr, None)
+            if cfg_obj is None:
+                continue
+            layer_types = getattr(cfg_obj, "layer_types", None)
+            if not isinstance(layer_types, list) or not layer_types:
+                continue
+            n_attn = sum(1 for t in layer_types if str(t) == "full_attention")
+            n_other = sum(1 for t in layer_types if str(t) != "full_attention")
+            if n_other > 0:
+                logger.info(
+                    "Hybrid model detected via layer_types on %s: "
+                    "rewriting num_layer from %d to %d (attention-only count)",
+                    cfg_attr, num_layer, n_attn,
+                )
+                num_layer = n_attn
+            break
         chunk_size = self.lmcache_config.chunk_size
         num_kv_head = model_config.get_num_kv_heads(parallel_config)
         head_size = model_config.get_head_size()
