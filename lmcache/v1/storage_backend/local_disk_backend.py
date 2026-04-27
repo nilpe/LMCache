@@ -27,6 +27,20 @@ from lmcache.v1.storage_backend.job_executor.pq_executor import (
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.path_sharder import PathSharder
 
+# Sidecar JSONL placed at the root of each disk-cache shard. One record
+# per `submit_put_task` carrying the key, byte size, tensor shape, dtype
+# and memory format. On `__init__`, every record whose corresponding
+# blob file still exists is re-registered via `insert_key`, so a fresh
+# process pointed at a populated disk path sees the previous process's
+# writes. Without this, the in-memory `self.dict` starts empty on every
+# boot and `contains` / `get_blocking` always miss until something is
+# stored in this process — which makes a "disk tier" useless across
+# restarts. The fix is intentionally local to the disk backend: the
+# rest of the cache stack already keys deterministically given a fixed
+# `PYTHONHASHSEED`, so the sidecar is the only piece needed for
+# end-to-end cross-process retrieve.
+_RALPH_DISK_SIDECAR_FILENAME = "_ralph_kv_index.jsonl"
+
 if TYPE_CHECKING:
     # First Party
     from lmcache.v1.cache_controller.worker import LMCacheWorker
@@ -180,8 +194,96 @@ class LocalDiskBackend(StorageBackendInterface):
         else:
             logger.warning("Controller message sender is not initialized")
 
+        # Re-hydrate self.dict from the sidecar JSONL so the disk tier
+        # actually survives process restarts. No-op if the sidecar is
+        # absent (first time this path is used).
+        try:
+            self._rehydrate_from_sidecar()
+        except Exception as e:
+            logger.warning(
+                "Disk-tier sidecar rehydrate failed (%r); cache starts empty",
+                e,
+            )
+
     def __str__(self) -> str:
         return "LocalDiskBackend"
+
+    def _sidecar_path(self) -> str:
+        return os.path.join(self.path, _RALPH_DISK_SIDECAR_FILENAME)
+
+    def _rehydrate_from_sidecar(self) -> int:
+        """Read the sidecar and call ``insert_key`` for every entry whose
+        blob is still on disk. Returns the number of keys re-registered."""
+        # Standard
+        import json
+
+        sidecar = self._sidecar_path()
+        if not os.path.exists(sidecar):
+            return 0
+        n = 0
+        with open(sidecar) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    key = CacheEngineKey.from_string(rec["key"])
+                    shape = torch.Size(rec["shape"])
+                    dtype = getattr(torch, rec["dtype"].replace("torch.", ""), None)
+                    fmt = getattr(MemoryFormat, rec["fmt"], None)
+                    size = int(rec["size"])
+                except (KeyError, ValueError, json.JSONDecodeError):
+                    continue
+                if dtype is None or fmt is None:
+                    continue
+                blob_path = self._key_to_path(key)
+                if not os.path.exists(blob_path):
+                    continue
+                try:
+                    self.insert_key(
+                        key, size=size, shape=shape, dtype=dtype, fmt=fmt,
+                    )
+                    n += 1
+                except Exception:
+                    continue
+        if n:
+            logger.info(
+                "Disk-tier sidecar: re-registered %d cache key(s) from %s",
+                n, sidecar,
+            )
+        return n
+
+    def _append_sidecar(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
+        """Append one JSONL record describing this put so a future
+        process can call ``insert_key`` on it via rehydrate."""
+        # Standard
+        import json
+
+        meta = memory_obj.metadata
+        try:
+            shape = list(meta.shape) if meta.shape is not None else None
+            dtype = str(meta.dtype) if meta.dtype is not None else None
+            fmt = meta.fmt.name if meta.fmt is not None else None
+            size = int(meta.phy_size)
+        except (AttributeError, TypeError):
+            return
+        if shape is None or dtype is None or fmt is None:
+            return
+        rec = {
+            "key": key.to_string(),
+            "shape": shape,
+            "dtype": dtype,
+            "fmt": fmt,
+            "size": size,
+        }
+        try:
+            with open(self._sidecar_path(), "a") as f:
+                f.write(json.dumps(rec) + "\n")
+        except OSError as e:
+            logger.warning(
+                "Disk-tier sidecar append failed for %r: %r", key, e,
+            )
 
     def _key_to_path(
         self,
@@ -354,6 +456,12 @@ class LocalDiskBackend(StorageBackendInterface):
             return None
 
         memory_obj.ref_count_up()
+
+        # Persist a sidecar record so a future process can rehydrate
+        # ``self.dict`` and find this entry without re-running the
+        # original put through vLLM. See ``_rehydrate_from_sidecar``
+        # above. Best-effort: failures are logged, never raised.
+        self._append_sidecar(key, memory_obj)
 
         asyncio.run_coroutine_threadsafe(
             self.disk_worker.submit_task(
