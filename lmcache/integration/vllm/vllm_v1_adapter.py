@@ -459,6 +459,14 @@ class LMCacheConnectorV1Impl:
             "LMCache v1 configuration is should be passed for vLLM v1."
         )
         self._apply_extra_config(config, vllm_config)
+        # Auto-detect chunk_size from the model's MambaSpec.block_size
+        # when the user requested ``chunk_size: auto`` (or any non-int /
+        # non-positive sentinel — see ``_parse_chunk_size`` in
+        # ``lmcache/v1/config.py``). For pure-attention models no
+        # MambaSpec is present and we fall back to the default 256.
+        # This must run BEFORE ``service_factory`` because the metadata
+        # builder (which uses the chunk_size in kv_shape) is downstream.
+        self._auto_resolve_chunk_size(config, parent)
         self.config = config
 
         service_factory = VllmServiceFactory(config, vllm_config, role.name.lower())
@@ -515,6 +523,57 @@ class LMCacheConnectorV1Impl:
                             "Updated config %s from vLLM extra config",
                             config_key,
                         )
+
+    def _auto_resolve_chunk_size(
+        self,
+        config: LMCacheEngineConfig,
+        parent: KVConnectorBase_V1,
+    ) -> None:
+        """Resolve ``chunk_size: auto`` from the model's MambaSpec.
+
+        Hybrid models (Qwen3-Next, Qwen3.5/3.6, LFM2, ...) need LMCache
+        ``chunk_size`` to equal the Mamba ``block_size`` so attn-lane
+        cache hits land on Mamba block boundaries (which is required for
+        the hybrid Mamba-state I/O path to find matching saved state).
+        Vanilla LMCache forces the user to look this number up by hand
+        from vLLM's startup log; this helper does it for them.
+
+        Resolution rule:
+          - if ``config.chunk_size`` is a positive int → keep as-is
+          - else (``"auto"``, 0, -1, or anything non-positive) →
+            inspect ``parent._kv_cache_config.kv_cache_groups`` for a
+            ``MambaSpec``; use the smallest ``block_size`` found.
+            For pure-attention models (no MambaSpec) fall back to 256.
+
+        Logged at INFO so the chosen value is visible at startup.
+        """
+        cs = config.chunk_size
+        if isinstance(cs, int) and cs > 0:
+            return  # user gave a concrete value; honour it
+        kv_cache_config = getattr(parent, "_kv_cache_config", None)
+        detected = None
+        if kv_cache_config is not None:
+            for g in getattr(kv_cache_config, "kv_cache_groups", []) or []:
+                spec = getattr(g, "kv_cache_spec", None)
+                if spec is not None and type(spec).__name__ == "MambaSpec":
+                    bs = getattr(spec, "block_size", 0)
+                    if isinstance(bs, int) and bs > 0:
+                        detected = bs if detected is None else min(detected, bs)
+        if detected is None:
+            logger.info(
+                "chunk_size resolution: no MambaSpec found in "
+                "kv_cache_config; falling back to default 256 "
+                "(set chunk_size explicitly for non-hybrid models if "
+                "you want a different value)"
+            )
+            config.chunk_size = 256
+        else:
+            logger.info(
+                "chunk_size resolution: chunk_size=%r → %d "
+                "(from MambaSpec.block_size, hybrid model)",
+                cs, detected,
+            )
+            config.chunk_size = detected
 
     def _init_connector_state(
         self,

@@ -58,10 +58,32 @@ _DEPRECATED_CONFIGS = {
     ),
 }
 
+def _parse_chunk_size(x: Any) -> Any:
+    """Accept ``int``, ``"auto"`` / ``"mamba_block_size"``, or 0/-1 as
+    a sentinel meaning "detect at connector init from
+    kv_cache_config". Anything else falls through to ``int(x)``.
+    The actual auto-detection happens in
+    ``lmcache.integration.vllm.vllm_v1_adapter`` once the vLLM-built
+    KV cache config is available."""
+    if isinstance(x, str):
+        s = x.strip().lower()
+        if s in ("auto", "mamba_block_size"):
+            return "auto"
+    try:
+        v = int(x)
+    except (TypeError, ValueError):
+        return "auto"
+    return v if v > 0 else "auto"
+
+
 # Single configuration definition center - add new config items only here
 _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
     # Basic configurations
-    "chunk_size": {"type": int, "default": 256, "env_converter": int},
+    "chunk_size": {
+        "type": Any,
+        "default": 256,
+        "env_converter": _parse_chunk_size,
+    },
     "local_cpu": {
         "type": bool,
         "default": True,

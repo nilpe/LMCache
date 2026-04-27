@@ -32,15 +32,13 @@ worker log line shows `need to load = 528`.
 Save as `lmcache.yaml` and point `LMCACHE_CONFIG_FILE` at it:
 
 ```yaml
-# Chunk size = the model's MambaSpec.block_size. This makes attn-lane
-# hits land on Mamba block boundaries so the recurrent-state restore
-# matches. Look up the model's Mamba block_size from vLLM's startup
-# log line "MambaSpec(block_size=N, ...)" or the
-# "Setting attention block size to N tokens" message — whichever vLLM
-# emits for your model. Examples:
-#   * Qwen/Qwen3.5-9B  -> 528
-#   * synthetic Qwen3-Next-tiny -> 48
-chunk_size: 528
+# Chunk size — must equal the model's MambaSpec.block_size for the
+# attn-lane cache hits to land on Mamba block boundaries. Set to
+# ``auto`` to let LMCache read the value out of vLLM's
+# kv_cache_config at connector init time (works for any hybrid model
+# vLLM supports). Pure-attention models with ``auto`` fall back to
+# the conventional 256.
+chunk_size: auto    # or set explicitly: e.g. 528 for Qwen/Qwen3.5-9B
 
 # Memory tier (CPU staging area). Required.
 local_cpu: true
@@ -97,9 +95,11 @@ pure-attention models too.
 
 ## Caveats
 
-* `chunk_size` must equal the model's Mamba `block_size`. A mismatch
-  causes attn-lane hits at non-aligned positions and the Mamba
-  restore lookup misses → divergent output.
+* `chunk_size: auto` is the recommended setting for hybrid models —
+  it reads the model's Mamba ``block_size`` directly from vLLM's
+  ``kv_cache_config`` at connector init time. Setting it manually is
+  only useful when you need a non-default value for a pure-attention
+  model.
 * Save granularity is per Mamba block (e.g. 528 tokens for
   Qwen3.5-9B). Prompts shorter than one block do not benefit from
   the Mamba half of the cache, only attn.
