@@ -733,6 +733,28 @@ class LMCacheConnectorV1Impl:
         # TODO(chunxiaozheng): `_init_kv_caches_from_forward_context` is
         #  not called, we should consider removing it.
         assert len(self.kv_caches) == 0 and len(kv_caches) > 0
+        # Hybrid models (Qwen3-Next, Qwen3.5/3.6, LFM2, ...) deliver the
+        # Mamba/recurrent layers as a list ``[conv_state, ssm_state]``
+        # rather than a single Tensor. The downstream layer-group builder
+        # and GPU connector both assume single-Tensor entries; passing
+        # them the unfiltered dict crashes the GPU connector at inference
+        # because its pointer array is sized to ``metadata.kv_shape[0]``
+        # (the attention-only count when the hybrid override in
+        # ``vllm_service_factory.get_or_create_metadata`` kicks in) and
+        # the values list contains Mamba entries it cannot dereference.
+        # Drop any non-Tensor entries here so only attention slots reach
+        # the layer-group builder. Mamba state is left to vLLM's own
+        # ``--mamba-cache-mode=align`` machinery (or to an external
+        # Mamba-state-IO patch on the worker side).
+        non_tensor = [k for k, v in kv_caches.items() if not isinstance(v, torch.Tensor)]
+        if non_tensor:
+            logger.info(
+                "Filtering %d non-tensor (hybrid Mamba) KV slot(s) "
+                "before LMCache registration: %s",
+                len(non_tensor),
+                non_tensor[:3] + (["..."] if len(non_tensor) > 3 else []),
+            )
+            kv_caches = {k: v for k, v in kv_caches.items() if isinstance(v, torch.Tensor)}
         self.kv_caches = kv_caches
         self._build_kv_layer_groups()
         self._manager.post_init()
