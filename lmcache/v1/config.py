@@ -289,6 +289,32 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
             x if isinstance(x, dict) else json.loads(x) if x else None
         ),
     },
+    # ── Hybrid (Mamba + Attention) state I/O ──────────────────────────
+    # When ``True`` and vLLM is loaded with the companion
+    # ``register_external_mamba_state_*`` hooks, LMCache also
+    # externalises the Mamba/recurrent state for hybrid models so a
+    # fresh process can resume both lanes from disk. When ``False``
+    # (the default), only attention KV is cached and hybrid models
+    # behave identically to vanilla LMCache 0.4.4.
+    "enable_hybrid_mamba_state_io": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
+    # Disk path for Mamba state files. ``None`` means "use the same
+    # directory as ``local_disk`` (so both lanes share one tier)".
+    # Any concrete path will be created if missing.
+    "hybrid_mamba_state_io_path": {
+        "type": Optional[str],
+        "default": None,
+        "env_converter": str,
+    },
+    # Max size (GiB) for the Mamba state disk tier.
+    "hybrid_mamba_state_io_size_gb": {
+        "type": float,
+        "default": 4.0,
+        "env_converter": float,
+    },
     "save_unfull_chunk": {
         "type": bool,
         "default": False,

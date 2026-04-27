@@ -467,6 +467,23 @@ class LMCacheConnectorV1Impl:
         # Start services managed by LMCacheManager
         self._manager.start_services()
 
+        # Hybrid (Mamba + Attn) state I/O: register save/restore hooks
+        # against vLLM if the user opted in via lmcache.yaml AND the
+        # host vLLM exposes the hook registration functions. No-op
+        # otherwise. Must run after ``start_services()`` so the
+        # metadata has been built.
+        if role == KVConnectorRole.WORKER:
+            try:
+                from lmcache.integration.vllm import hybrid_mamba_state_io
+                meta = self._manager.lmcache_engine_metadata
+                if meta is not None:
+                    hybrid_mamba_state_io.maybe_install(config, meta)
+            except Exception as e:
+                logger.warning(
+                    "hybrid_mamba_state_io setup failed (continuing "
+                    "without it): %r", e,
+                )
+
         # Initialize connector-specific state
         self._init_connector_state(role, vllm_config, config)
 
