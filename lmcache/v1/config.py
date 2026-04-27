@@ -323,18 +323,35 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
-    # Disk path for Mamba state files. ``None`` means "use the same
-    # directory as ``local_disk`` (so both lanes share one tier)".
-    # Any concrete path will be created if missing.
+    # The sidecar that holds the Mamba state is itself a small
+    # LMCache instance — same field schema as this top-level config,
+    # nested under one key. ``None`` means "use defaults plus inherit
+    # local_disk from the parent so both lanes share one tier".
+    # Example:
+    #   hybrid_mamba_state_io_config:
+    #     local_cpu: true
+    #     max_local_cpu_size: 0.5
+    #     local_disk: /var/lmcache_mamba
+    #     max_local_disk_size: 4.0
+    "hybrid_mamba_state_io_config": {
+        "type": Optional[dict],
+        "default": None,
+        "env_converter": lambda x: (
+            x if isinstance(x, dict) else json.loads(x) if x else None
+        ),
+    },
+    # ── Deprecated aliases (kept for back-compat with the first cut) ──
+    # Use ``hybrid_mamba_state_io_config.local_disk`` /
+    # ``...max_local_disk_size`` instead. If both forms are set, the
+    # sub-config wins.
     "hybrid_mamba_state_io_path": {
         "type": Optional[str],
         "default": None,
         "env_converter": str,
     },
-    # Max size (GiB) for the Mamba state disk tier.
     "hybrid_mamba_state_io_size_gb": {
         "type": float,
-        "default": 4.0,
+        "default": 0.0,
         "env_converter": float,
     },
     "save_unfull_chunk": {

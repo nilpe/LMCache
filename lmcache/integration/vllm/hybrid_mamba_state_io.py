@@ -373,6 +373,46 @@ def _start_loop_thread() -> asyncio.AbstractEventLoop:
     return loop
 
 
+def _build_sidecar_config(
+    parent: LMCacheEngineConfig,
+    sub_dict: Optional[dict],
+) -> LMCacheEngineConfig:
+    """Build a sidecar LMCacheEngineConfig from a sub-section dict.
+
+    The sub-section uses the same field schema as the top-level config
+    — anything you can write in lmcache.yaml you can write here.
+    Construction:
+
+      1. Start from LMCache defaults.
+      2. Apply every key from ``sub_dict`` onto the sidecar.
+      3. ``chunk_size`` is force-inherited from the parent: the
+         attn-lane and the sidecar must agree on chunk boundaries
+         because the prefix-token-hash drives both.
+      4. ``local_disk``: if the user did not name a sidecar disk path,
+         fall back to the parent's ``local_disk`` so the sidecar lives
+         alongside the main tier (one disk dir, two lanes).
+    """
+    sidecar = LMCacheEngineConfig.from_defaults()
+    if sub_dict:
+        for k, v in sub_dict.items():
+            try:
+                setattr(sidecar, k, v)
+            except (AttributeError, TypeError):
+                logger.warning(
+                    "Unknown field in hybrid_mamba_state_io_config: "
+                    "%s = %r (ignored)", k, v,
+                )
+    # The chunk_size is part of the cache key hash domain. Sidecar and
+    # parent must agree, so force the parent's value.
+    sidecar.chunk_size = parent.chunk_size
+    # Default the sidecar disk path to the parent's, so the simplest
+    # form ``hybrid_mamba_state_io_config: {}`` (or omitted entirely)
+    # still works.
+    if not sidecar.local_disk and parent.local_disk:
+        sidecar.local_disk = parent.local_disk
+    return sidecar
+
+
 def maybe_install(
     config: LMCacheEngineConfig,
     metadata: LMCacheMetadata,
@@ -404,29 +444,40 @@ def maybe_install(
         )
         return False
 
-    # Decide where the Mamba state files live.
-    disk_path = getattr(config, "hybrid_mamba_state_io_path", None) or config.local_disk
-    if disk_path is None:
+    # Resolve the sub-config. Newer form is
+    # ``hybrid_mamba_state_io_config: { ...same schema as parent... }``;
+    # older keys (``hybrid_mamba_state_io_path`` /
+    # ``hybrid_mamba_state_io_size_gb``) are still accepted as
+    # deprecated aliases — they map onto the sub-config's ``local_disk``
+    # and ``max_local_disk_size`` if and only if those have not been
+    # set in the new form.
+    sub_dict = dict(getattr(config, "hybrid_mamba_state_io_config", None) or {})
+    legacy_path = getattr(config, "hybrid_mamba_state_io_path", None)
+    legacy_size_gb = float(
+        getattr(config, "hybrid_mamba_state_io_size_gb", 0.0) or 0.0
+    )
+    if legacy_path and "local_disk" not in sub_dict:
         logger.warning(
-            "hybrid_mamba_state_io: neither hybrid_mamba_state_io_path nor "
-            "local_disk is set; skipping"
+            "hybrid_mamba_state_io_path is deprecated; please move it "
+            "to hybrid_mamba_state_io_config.local_disk"
+        )
+        sub_dict["local_disk"] = legacy_path
+    if legacy_size_gb > 0 and "max_local_disk_size" not in sub_dict:
+        logger.warning(
+            "hybrid_mamba_state_io_size_gb is deprecated; please move it "
+            "to hybrid_mamba_state_io_config.max_local_disk_size"
+        )
+        sub_dict["max_local_disk_size"] = legacy_size_gb
+
+    sub_config = _build_sidecar_config(config, sub_dict)
+    if not sub_config.local_disk:
+        logger.warning(
+            "hybrid_mamba_state_io: no disk path resolved (set "
+            "hybrid_mamba_state_io_config.local_disk or top-level "
+            "local_disk); skipping install"
         )
         return False
-    os.makedirs(disk_path, exist_ok=True)
-
-    # Build a dedicated LocalDiskBackend for Mamba state, wired through
-    # a lightweight CPU allocator. We reuse the user's
-    # ``hybrid_mamba_state_io_size_gb`` budget here; it's separate from
-    # the attention-lane budget.
-    sub_config = LMCacheEngineConfig.from_defaults()
-    sub_config.local_cpu = True
-    sub_config.max_local_cpu_size = 0.5  # only used for staging
-    sub_config.local_disk = disk_path
-    sub_config.max_local_disk_size = float(
-        getattr(config, "hybrid_mamba_state_io_size_gb", 4.0)
-    )
-    sub_config.chunk_size = config.chunk_size
-    sub_config.cache_policy = config.cache_policy
+    os.makedirs(sub_config.local_disk, exist_ok=True)
 
     _LOOP = _start_loop_thread()
 
@@ -444,7 +495,9 @@ def maybe_install(
 
     _INSTALLED = True
     logger.info(
-        "hybrid_mamba_state_io: installed; disk=%s size=%.1f GiB chunk_size=%d",
-        disk_path, sub_config.max_local_disk_size, sub_config.chunk_size,
+        "hybrid_mamba_state_io: installed; disk=%s size=%.1f GiB "
+        "chunk_size=%d (from parent)",
+        sub_config.local_disk, sub_config.max_local_disk_size,
+        sub_config.chunk_size,
     )
     return True

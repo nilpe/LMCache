@@ -57,10 +57,23 @@ save_unfull_chunk: true
 # register_external_mamba_state_{save,restore}_hook in
 # vllm.v1.worker.gpu_model_runner / vllm.v1.worker.mamba_utils.
 enable_hybrid_mamba_state_io: true
-# Where Mamba state files live. ``null`` means "share the directory
-# with local_disk", which is the simplest option.
-hybrid_mamba_state_io_path: null
-hybrid_mamba_state_io_size_gb: 4.0
+
+# Sidecar config — same field schema as the top-level lmcache config.
+# Anything you can write up there you can write in here. Fields not
+# specified default to LMCache's defaults except:
+#   - ``chunk_size`` is force-inherited from the parent (cache key
+#     hashes must agree across attn lane and the sidecar);
+#   - ``local_disk`` falls back to the parent's local_disk if you do
+#     not name a separate path (so an empty config "just works" by
+#     sharing the parent's tier directory).
+# The simplest non-empty example: dedicate a separate disk dir + budget.
+hybrid_mamba_state_io_config:
+  local_cpu: true
+  max_local_cpu_size: 0.5
+  local_disk: /var/lmcache_mamba   # or omit → shares with the main local_disk above
+  max_local_disk_size: 4.0
+  # → other backends in the same schema work here too as you grow
+  #   the sidecar (e.g. remote_url: redis://..., nixl_backends: [...])
 ```
 
 ## vLLM CLI
@@ -71,11 +84,13 @@ LMCACHE_CONFIG_FILE=lmcache.yaml \
 vllm serve Qwen/Qwen3.5-9B \
   --enable-prefix-caching \
   --no-disable-hybrid-kv-cache-manager \
-  --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.local_cpu":true,"lmcache.max_local_cpu_size":2.0,"lmcache.local_disk":"/var/lmcache/qwen3.5-9b","lmcache.max_local_disk_size":8.0,"lmcache.chunk_size":528,"lmcache.save_unfull_chunk":true,"lmcache.enable_hybrid_mamba_state_io":true,"lmcache.hybrid_mamba_state_io_size_gb":4.0}}'
+  --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'
 ```
 
-(Either `LMCACHE_CONFIG_FILE` or the `kv_connector_extra_config` form
-work; `extra_config` keys are prefixed `lmcache.`.)
+The YAML file is the recommended form — keep config in one place. The
+``kv_connector_extra_config`` form is also accepted for ad-hoc runs;
+nested dicts (e.g. ``lmcache.hybrid_mamba_state_io_config``) are
+JSON-encoded inline.
 
 ## Verify
 
