@@ -5,15 +5,23 @@
 # chunk_size: auto resolves to MambaSpec.block_size at LMCache init.
 
 chunk_size: auto
-local_cpu: true
-max_local_cpu_size: 5.0
+
+# CPU tier writeback OFF (per user direction): the staging buffer was
+# overflowing under concurrent workload. With local_cpu: false the
+# storage_manager skips CPU-tier writes. local_cpu_backend itself is
+# still constructed (max_local_cpu_size > 0 is the gate) so
+# LocalDiskBackend can use it as a pinned-DRAM allocator pool for the
+# disk → GPU copy path.
+local_cpu: false
+max_local_cpu_size: 10.0
+
 local_disk: /pmem/kogi_lmcache_qwen36/attn
 max_local_disk_size: 200.0
 save_unfull_chunk: true
 
 enable_hybrid_mamba_state_io: true
 hybrid_mamba_state_io_config:
-  local_cpu: true
-  max_local_cpu_size: 1.0
+  local_cpu: false
+  max_local_cpu_size: 2.0
   local_disk: /pmem/kogi_lmcache_qwen36/mamba
   max_local_disk_size: 50.0

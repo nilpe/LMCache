@@ -7,8 +7,13 @@
 # (db58a844). chunk_size: auto resolves to MambaSpec.block_size.
 
 chunk_size: auto
-local_cpu: true
-max_local_cpu_size: 5.0
+
+# CPU tier writeback OFF (storage_manager skips CPU-tier writes).
+# DevDaxBackend still uses local_cpu_backend.allocate() as a DRAM pool
+# for DAX → DRAM AVX-512 NT memcpy in get_blocking; the allocator is
+# alive whenever max_local_cpu_size > 0.
+local_cpu: false
+max_local_cpu_size: 10.0
 
 # DevDaxBackend ignores local_disk as a path; the gate in
 # CreateStorageBackends just needs it non-empty. Pointing at the dax
@@ -22,15 +27,17 @@ extra_config:
   devdax_copy_mode: avx512_nt
   read_engine: c_pthread
   disk_read_threads: 47
-  use_bar1: true
-  bar1_threads: 16
+  # Start with the simple DAX → CPU → GPU path. BAR1 push and GPU DMA
+  # direct can be re-enabled once the hybrid retrieve mismatch is
+  # localized away from those code paths.
+  use_bar1: false
 
 save_unfull_chunk: true
 
 enable_hybrid_mamba_state_io: true
 hybrid_mamba_state_io_config:
-  local_cpu: true
-  max_local_cpu_size: 1.0
+  local_cpu: false
+  max_local_cpu_size: 2.0
   max_local_disk_size: 100.0
   extra_config:
     disk_backend_type: devdax
