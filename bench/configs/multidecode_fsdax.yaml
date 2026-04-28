@@ -1,0 +1,19 @@
+# LMCache YAML for multidecode_fsdax.toml — vanilla LocalDiskBackend on
+# /pmem/. Qwen3.6-27B is hybrid (linear_attention + full_attention with
+# full_attention_interval=4) so enable_hybrid_mamba_state_io: true and
+# the sidecar inherits this YAML's (FSDAX) local_disk by default.
+# chunk_size: auto resolves to MambaSpec.block_size at LMCache init.
+
+chunk_size: auto
+local_cpu: true
+max_local_cpu_size: 5.0
+local_disk: /pmem/lmcache_qwen36/attn
+max_local_disk_size: 200.0
+save_unfull_chunk: true
+
+enable_hybrid_mamba_state_io: true
+hybrid_mamba_state_io_config:
+  local_cpu: true
+  max_local_cpu_size: 1.0
+  local_disk: /pmem/lmcache_qwen36/mamba
+  max_local_disk_size: 50.0

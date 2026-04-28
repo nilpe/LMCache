@@ -1,0 +1,42 @@
+# LMCache YAML for multidecode_devdax.toml — DevDaxBackend on /dev/dax0.0.
+# Both attn lane and Mamba sidecar live on the DAX device:
+#   - parent (attn KV) at offset 0
+#   - sidecar (Mamba state) at offset 1 TiB
+# The sidecar dispatch arrives via extra_config.disk_backend_type, which
+# this fork's hybrid_mamba_state_io._build_disk_backend honours
+# (db58a844). chunk_size: auto resolves to MambaSpec.block_size.
+
+chunk_size: auto
+local_cpu: true
+max_local_cpu_size: 5.0
+
+# DevDaxBackend ignores local_disk as a path; the gate in
+# CreateStorageBackends just needs it non-empty. Pointing at the dax
+# device documents intent.
+local_disk: /dev/dax0.0
+max_local_disk_size: 1000.0
+extra_config:
+  disk_backend_type: devdax
+  devdax_path: /dev/dax0.0
+  devdax_offset: 0
+  devdax_copy_mode: avx512_nt
+  read_engine: c_pthread
+  disk_read_threads: 47
+  use_bar1: true
+  bar1_threads: 16
+
+save_unfull_chunk: true
+
+enable_hybrid_mamba_state_io: true
+hybrid_mamba_state_io_config:
+  local_cpu: true
+  max_local_cpu_size: 1.0
+  max_local_disk_size: 100.0
+  extra_config:
+    disk_backend_type: devdax
+    devdax_path: /dev/dax0.0
+    devdax_offset: 1099511627776   # 1 TiB offset, 2 MiB-aligned
+    devdax_copy_mode: avx512_nt
+    read_engine: c_pthread
+    disk_read_threads: 8
+    use_bar1: false
