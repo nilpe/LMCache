@@ -1,0 +1,20 @@
+# Baseline: ralph branch with vanilla LocalDiskBackend on FSDAX (/pmem/...).
+# Both attn lane and Mamba sidecar live on FSDAX. This is the path that
+# nilpe verified end-to-end on Qwen/Qwen3.5-9B (num_cached_tokens=528).
+
+chunk_size: auto    # → MambaSpec.block_size, e.g. 528 for Qwen3.5-9B
+
+local_cpu: true
+max_local_cpu_size: 5.0
+
+local_disk: /pmem/lmcache_qwen35/attn
+max_local_disk_size: 200.0
+
+save_unfull_chunk: true
+
+enable_hybrid_mamba_state_io: true
+hybrid_mamba_state_io_config:
+  local_cpu: true
+  max_local_cpu_size: 1.0
+  local_disk: /pmem/lmcache_qwen35/mamba
+  max_local_disk_size: 50.0

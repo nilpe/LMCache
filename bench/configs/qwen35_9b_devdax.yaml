@@ -1,0 +1,47 @@
+# DevDAX path: ralph branch with DevDaxBackend on /dev/dax0.0.
+# Parent (attn lane) at offset 0 (1 TiB slab), Mamba sidecar at offset 1 TiB.
+# Backends are picked from extra_config.disk_backend_type — the parent
+# dispatch lives in CreateStorageBackends, the sidecar dispatch in
+# hybrid_mamba_state_io._build_disk_backend (added by this fork's
+# db58a844 commit).
+
+chunk_size: auto
+
+local_cpu: true
+max_local_cpu_size: 5.0
+
+# local_disk is required by the gate in CreateStorageBackends but the
+# DevDaxBackend class does not use it as a filesystem path; it reads
+# only ``max_local_disk_size`` (slab budget) and the ``extra_config.*``
+# devdax knobs. Pointing it at the dax device makes the gate pass and
+# documents intent.
+local_disk: /dev/dax0.0
+max_local_disk_size: 1000.0   # 1000 GiB slab for the attn lane
+
+extra_config:
+  disk_backend_type: devdax
+  devdax_path: /dev/dax0.0
+  devdax_offset: 0             # attn lane occupies the first slab
+  devdax_copy_mode: avx512_nt
+  read_engine: c_pthread
+  disk_read_threads: 47
+  use_bar1: true
+  bar1_threads: 16
+
+save_unfull_chunk: true
+
+enable_hybrid_mamba_state_io: true
+hybrid_mamba_state_io_config:
+  local_cpu: true
+  max_local_cpu_size: 1.0
+  # No local_disk for the sidecar in devdax mode — the relaxed gate in
+  # _build_disk_backend skips ``os.makedirs`` when the backend is devdax.
+  max_local_disk_size: 100.0   # 100 GiB slab for Mamba state
+  extra_config:
+    disk_backend_type: devdax
+    devdax_path: /dev/dax0.0
+    devdax_offset: 1099511627776   # 1 TiB offset, 2 MiB-aligned
+    devdax_copy_mode: avx512_nt
+    read_engine: c_pthread
+    disk_read_threads: 8
+    use_bar1: false              # state-restore payload is tiny per layer
