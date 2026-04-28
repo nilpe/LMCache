@@ -2,14 +2,14 @@
 # Same shape as multidecode_fsdax.toml; only LMCache YAML differs.
 
 [paths]
-src_dir = "/home/NBB/kogi/work/workspace/archived/test/LMBenchmark/real-multi-round-qa/data_hf/32k"
+src_dir = "/home/NBB/kogi/work/workspace/archived/test/LMBenchmark/real-multi-round-qa/data_hf/16k"
 workdir = "/work/0/NBB/kogi/workspace/nilpe-lmcache/bench/results/devdax"
 hf_model = "/work/NBB/kogi/hf_cache/hub/models--Qwen--Qwen3.6-27B/snapshots/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"
 file_pattern = "*.txt"
 
 [server]
 tp_size = 1
-max_model_len = 32768
+max_model_len = 65536
 gpu_mem_util = 0.85
 dtype = "auto"
 kv_transfer_config = "'{\"kv_connector\":\"LMCacheConnectorV1\",\"kv_role\":\"kv_both\"}' --no-disable-hybrid-kv-cache-manager --enable-prefix-caching"

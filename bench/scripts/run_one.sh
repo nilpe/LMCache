@@ -20,18 +20,22 @@ mkdir -p "${WORKDIR}"
 CPU_LOG_DIR="${WORKDIR}/cpu_logs"
 mkdir -p "${CPU_LOG_DIR}"
 
-# Per-user PMEM cache root so we don't fight other users' leftover dirs
-# in /pmem/. Both fsdax and devdax write here (devdax uses it only as a
-# placeholder local_disk; the actual data lives on /dev/dax0.0).
-PMEM_ROOT="/pmem/${USER}_lmcache_qwen36"
-mpirun ${NQSV_MPIOPTS} -np 4 -npernode 1 --bind-to none \
-    bash -c "
-        if [ -d '${PMEM_ROOT}' ] && [ -O '${PMEM_ROOT}' ]; then
-            rm -rf '${PMEM_ROOT}' 2>/dev/null
-        fi
-        mkdir -p '${PMEM_ROOT}/attn' '${PMEM_ROOT}/mamba'
-        ls -lad '${PMEM_ROOT}' 2>&1
-    " 2>&1 || echo "[WARN] could not prepare ${PMEM_ROOT}; relying on existing state"
+# fsdax writes blob files under /pmem/${USER}_lmcache_qwen36/{attn,mamba}.
+# devdax writes raw bytes into /dev/dax0.0 directly via mmap, so there's
+# nothing to prepare on the filesystem side. With USE_DEVDAX=pmemkv set
+# (devdax bench), /pmem/ is mounted as raw DAX and is NOT writable as a
+# filesystem — skip the cleanup branch there.
+if [ "${LABEL}" = "fsdax" ]; then
+    PMEM_ROOT="/pmem/${USER}_lmcache_qwen36"
+    mpirun ${NQSV_MPIOPTS} -np 4 -npernode 1 --bind-to none \
+        bash -c "
+            if [ -d '${PMEM_ROOT}' ] && [ -O '${PMEM_ROOT}' ]; then
+                rm -rf '${PMEM_ROOT}' 2>/dev/null
+            fi
+            mkdir -p '${PMEM_ROOT}/attn' '${PMEM_ROOT}/mamba'
+            ls -lad '${PMEM_ROOT}' 2>&1
+        " 2>&1 || echo "[WARN] could not prepare ${PMEM_ROOT}; relying on existing state"
+fi
 
 # Patch workdir into the TOML on a temp copy so the rust harness writes
 # under the timestamped result dir.
