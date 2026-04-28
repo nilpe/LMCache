@@ -7,7 +7,7 @@
 chunk_size: auto
 local_cpu: true
 max_local_cpu_size: 5.0
-local_disk: /pmem/lmcache_qwen36/attn
+local_disk: /pmem/kogi_lmcache_qwen36/attn
 max_local_disk_size: 200.0
 save_unfull_chunk: true
 
@@ -15,5 +15,5 @@ enable_hybrid_mamba_state_io: true
 hybrid_mamba_state_io_config:
   local_cpu: true
   max_local_cpu_size: 1.0
-  local_disk: /pmem/lmcache_qwen36/mamba
+  local_disk: /pmem/kogi_lmcache_qwen36/mamba
   max_local_disk_size: 50.0

@@ -1,7 +1,7 @@
 #!/bin/bash
 #PBS -A NBB
 #PBS -q gpu
-#PBS -l elapstim_req=4:00:00
+#PBS -l elapstim_req=2:00:00
 #PBS -N rl_dvf
 #PBS -o /work/0/NBB/kogi/workspace/nilpe-lmcache/bench/results/rl_dvf.log
 #PBS -e /work/0/NBB/kogi/workspace/nilpe-lmcache/bench/results/rl_dvf.err
@@ -32,9 +32,9 @@ for label in fsdax devdax; do
     bash "${RUN_ONE}" "${label}" || echo "[WARN] ${label} failed, continuing"
 done
 
-# Final cleanup: don't leave /pmem/lmcache behind for the next user.
+# Final cleanup: don't leave the user-prefixed PMEM dir behind.
 mpirun ${NQSV_MPIOPTS} -np 4 -npernode 1 --bind-to none \
-    bash -c "rm -rf /pmem/lmcache" 2>&1 || true
+    bash -c "rm -rf /pmem/${USER}_lmcache_qwen36" 2>&1 || true
 
 echo ""
 echo "============================================================"
