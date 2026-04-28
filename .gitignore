@@ -148,3 +148,4 @@ core.*
 lmcache/v1/storage_backend/bar1_bridge.so
 lmcache/v1/storage_backend/*.so
 lmcache/v1/storage_backend/rust_read/target/
+bench/results/
