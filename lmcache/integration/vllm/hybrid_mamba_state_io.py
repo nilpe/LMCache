@@ -53,6 +53,7 @@ from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
 
@@ -63,7 +64,7 @@ if TYPE_CHECKING:
 
 
 _INSTALLED = False
-_DISK_BACKEND: Optional[LocalDiskBackend] = None
+_DISK_BACKEND: Optional[StorageBackendInterface] = None
 _LOOP: Optional[asyncio.AbstractEventLoop] = None
 _LOOP_THREAD: Optional[threading.Thread] = None
 _MODEL_NAME: str = "lmcache-hybrid-mamba"
@@ -470,22 +471,32 @@ def maybe_install(
         sub_dict["max_local_disk_size"] = legacy_size_gb
 
     sub_config = _build_sidecar_config(config, sub_dict)
-    if not sub_config.local_disk:
-        logger.warning(
-            "hybrid_mamba_state_io: no disk path resolved (set "
-            "hybrid_mamba_state_io_config.local_disk or top-level "
-            "local_disk); skipping install"
-        )
-        return False
-    os.makedirs(sub_config.local_disk, exist_ok=True)
+    sub_extra = sub_config.extra_config or {}
+    sub_backend_type = sub_extra.get("disk_backend_type", "default")
+    # devdax is path-less (lives on /dev/dax*); every other backend
+    # writes blob files under sub_config.local_disk and needs that path
+    # to exist before init.
+    if sub_backend_type != "devdax":
+        if not sub_config.local_disk:
+            logger.warning(
+                "hybrid_mamba_state_io: no disk path resolved (set "
+                "hybrid_mamba_state_io_config.local_disk or top-level "
+                "local_disk); skipping install"
+            )
+            return False
+        os.makedirs(sub_config.local_disk, exist_ok=True)
+    else:
+        if not sub_extra.get("devdax_path"):
+            logger.warning(
+                "hybrid_mamba_state_io: disk_backend_type=devdax requires "
+                "extra_config.devdax_path; skipping install"
+            )
+            return False
 
     _LOOP = _start_loop_thread()
 
     cpu = LocalCPUBackend(sub_config, metadata, dst_device="cpu")
-    _DISK_BACKEND = LocalDiskBackend(
-        sub_config, loop=_LOOP, local_cpu_backend=cpu,
-        dst_device="cpu", metadata=metadata,
-    )
+    _DISK_BACKEND = _build_disk_backend(sub_config, _LOOP, cpu, metadata)
 
     # Capture model name for keys (used in _make_state_key).
     _MODEL_NAME = metadata.model_name or "lmcache-hybrid-mamba"
@@ -495,9 +506,67 @@ def maybe_install(
 
     _INSTALLED = True
     logger.info(
-        "hybrid_mamba_state_io: installed; disk=%s size=%.1f GiB "
+        "hybrid_mamba_state_io: installed; backend=%s disk=%s size=%.1f GiB "
         "chunk_size=%d (from parent)",
+        type(_DISK_BACKEND).__name__,
         sub_config.local_disk, sub_config.max_local_disk_size,
         sub_config.chunk_size,
     )
     return True
+
+
+def _build_disk_backend(
+    sub_config: LMCacheEngineConfig,
+    loop: asyncio.AbstractEventLoop,
+    local_cpu_backend: LocalCPUBackend,
+    metadata: LMCacheMetadata,
+) -> StorageBackendInterface:
+    """Pick the disk backend class for the sidecar from
+    ``sub_config.extra_config.disk_backend_type``.
+
+    Mirrors the dispatch in ``CreateStorageBackends`` in
+    ``lmcache/v1/storage_backend/__init__.py`` so the sidecar honours the
+    same YAML knobs as the attention lane:
+
+      - ``"default"`` (or unset) → ``LocalDiskBackend``
+      - ``"threaded"``           → ``ThreadedDiskBackend``
+      - ``"mmap"``               → ``MmapDiskBackend``
+      - ``"threaded_mmap"``      → ``ThreadedMmapDiskBackend``
+      - ``"devdax"``             → ``DevDaxBackend``
+
+    Imports are lazy so missing native deps (e.g. ``bar1_bridge.so`` for
+    ``DevDaxBackend``) only fail when the user explicitly opts in.
+    """
+    extra = sub_config.extra_config or {}
+    disk_backend_type = extra.get("disk_backend_type", "default")
+    backend_cls: type[StorageBackendInterface] = LocalDiskBackend
+
+    if disk_backend_type == "threaded":
+        from lmcache.v1.storage_backend.threaded_disk_backend import (
+            ThreadedDiskBackend,
+        )
+        backend_cls = ThreadedDiskBackend
+    elif disk_backend_type == "mmap":
+        from lmcache.v1.storage_backend.threaded_disk_backend import (
+            MmapDiskBackend,
+        )
+        backend_cls = MmapDiskBackend
+    elif disk_backend_type == "threaded_mmap":
+        from lmcache.v1.storage_backend.threaded_disk_backend import (
+            ThreadedMmapDiskBackend,
+        )
+        backend_cls = ThreadedMmapDiskBackend
+    elif disk_backend_type == "devdax":
+        from lmcache.v1.storage_backend.devdax_backend import DevDaxBackend
+        backend_cls = DevDaxBackend
+    elif disk_backend_type != "default":
+        logger.warning(
+            "hybrid_mamba_state_io: unknown disk_backend_type=%r; "
+            "falling back to LocalDiskBackend",
+            disk_backend_type,
+        )
+
+    return backend_cls(
+        sub_config, loop=loop, local_cpu_backend=local_cpu_backend,
+        dst_device="cpu", metadata=metadata,
+    )
