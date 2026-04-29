@@ -9,6 +9,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -27,7 +28,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
+class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -211,3 +212,20 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             returned by the engine.
         """
         return self._lmcache_engine.request_finished(request, block_ids)
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        """SupportsHMA entry point for hybrid models.
+
+        LMCache tracks offload state per request, not per kv-cache group,
+        so flatten the per-group block lists and delegate to the existing
+        ``request_finished``. Same pattern as the non-Dynamic
+        LMCacheConnectorV1.request_finished_all_groups.
+        """
+        flat_block_ids: list[int] = []
+        for group in block_ids:
+            flat_block_ids.extend(group)
+        return self._lmcache_engine.request_finished(request, flat_block_ids)
