@@ -475,12 +475,15 @@ class LocalDiskBackend(StorageBackendInterface):
 
         memory_obj.ref_count_up()
 
-        # Persist a sidecar record so a future process can rehydrate
-        # ``self.dict`` and find this entry without re-running the
-        # original put through vLLM. See ``_rehydrate_from_sidecar``
-        # above. Best-effort: failures are logged, never raised.
-        self._append_sidecar(key, memory_obj)
-
+        # NOTE: the JSONL sidecar append used to live here, in the
+        # synchronous ``submit_put_task`` path. Per-put open()+write()+
+        # close() to ``/pmem/.../_ralph_kv_index.jsonl`` on the *vLLM
+        # forward thread* serialised every save through the FSDAX, and
+        # under the Mamba state-I/O hook (which fires N_layers × 2
+        # sub-states × M concurrent reqs puts per forward step) it
+        # backed the engine up enough to blow past the bench's 120 s
+        # SSE timeout. Move the append into the async writer below so
+        # only the actual disk write runs on the I/O thread.
         asyncio.run_coroutine_threadsafe(
             self.disk_worker.submit_task(
                 "put",
@@ -649,6 +652,14 @@ class LocalDiskBackend(StorageBackendInterface):
 
         # TODO(Jiayi): need to add ref count in disk memory object
         self.write_file(buffer, path)
+
+        # Best-effort sidecar append for cross-process rehydrate. Lives
+        # on this async I/O thread so the synchronous submit_put_task
+        # caller (= vLLM forward thread, when invoked via the Mamba
+        # state-I/O save hook) is not blocked by per-put filesystem
+        # opens. ``_append_sidecar`` reads ``memory_obj.metadata``, so
+        # call it before the ref_count_down below frees the slot.
+        self._append_sidecar(key, memory_obj)
 
         # ref count down here because there's a ref_count_up in
         # `submit_put_task` above.
