@@ -374,17 +374,25 @@ def calculate_local_rank_and_world_size(vllm_config: "VllmConfig") -> Tuple[int,
     if global_world_size <= num_gpus:
         # single node case
         return parallel_config.rank, parallel_config.world_size
-    else:
-        tp_size = parallel_config.tensor_parallel_size
-        pp_size = parallel_config.pipeline_parallel_size
-        local_world_size = global_world_size // pp_size
-        assert local_world_size == tp_size, (
-            "LMCache is operating under the assumption that the "
-            "local world size is equal to the tensor parallel size "
-            "in multi-node deployment."
-        )
-        local_worker_id = global_rank % local_world_size
-        return local_worker_id, local_world_size
+
+    # Multi-node case. The original implementation assumed "Tensor
+    # Parallel is intra-node" and "local_world_size == tp_size", but
+    # that breaks on HPC clusters with 1 GPU/node where TP spans
+    # multiple nodes — global_rank=1 then resolves to local_worker_id=1
+    # (cuda:1) on a node that only has cuda:0, blowing up with
+    # "AcceleratorError: CUDA error: invalid device ordinal".
+    #
+    # The robust formulation: there are at most ``num_gpus`` workers on
+    # this physical node, regardless of how vLLM has partitioned them
+    # across TP/PP groups. local_worker_id = global_rank % num_gpus.
+    if num_gpus == 0:
+        # CPU-only node (e.g. scheduler placeholder); fall back to the
+        # global rank so callers that don't actually allocate CUDA can
+        # still keep going.
+        return global_rank, global_world_size
+    local_world_size = num_gpus
+    local_worker_id = global_rank % num_gpus
+    return local_worker_id, local_world_size
 
 
 def validate_mla_config(config: LMCacheEngineConfig, use_mla: bool) -> None:
