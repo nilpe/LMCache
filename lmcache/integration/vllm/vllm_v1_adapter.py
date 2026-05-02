@@ -147,6 +147,7 @@ class RequestTracker:
         num_tokens_to_compute: int,
         lmcache_cached_tokens: int,
         skip_save: bool,
+        attention_group_indices: Optional[list[int]] = None,
     ) -> "RequestTracker":
         """Create the request tracker from a new request.
 
@@ -168,17 +169,29 @@ class RequestTracker:
         unfolded_block_ids = []
 
         if not isinstance(new_request.block_ids[0], list):
-            unfolded_block_ids = new_request.block_ids.copy()
+            # Legacy single-group format (one flat list of block ids).
+            unfolded_block_ids = list(new_request.block_ids)
         else:
-            # According to the vLLM code
-            # (https://github.com/vllm-project/vllm/blob/main/vllm/v1/core/
-            # sched/scheduler.py#L943),
-            # only one KVCacheGroup is supported in connector for now.
-
-            # TODO: Please support multiple KVCacheGroup in connector.
-            # NOTE: Also, `update` method in RequestTracker should be
-            # updated accordingly.
-            unfolded_block_ids = new_request.block_ids[0].copy()
+            # Hybrid memory allocator (HMA) hands us
+            # ``block_ids = (group0_blocks, group1_blocks, ...)`` — one
+            # entry per ``kv_cache_group``. LMCache only externalises
+            # *attention* KV (Mamba state is handled separately by the
+            # hybrid_mamba_state_io sidecar), so concatenate the block
+            # ids from every attention group and skip Mamba groups.
+            #
+            # ``attention_group_indices`` is computed once on the worker
+            # in ``LMCacheConnectorV1Impl._compute_attention_group_indices``
+            # (see ``register_kv_caches``). For pure-attention models the
+            # indices default to ``[0]`` which restores the original
+            # single-group behaviour.
+            indices = attention_group_indices
+            if indices is None:
+                # Defensive fallback for callers that haven't been
+                # updated yet — keep the legacy first-group-only path.
+                indices = [0]
+            for gi in indices:
+                if gi < len(new_request.block_ids):
+                    unfolded_block_ids.extend(new_request.block_ids[gi])
 
         # NOTE: Initialized in `update_state_after_alloc`
         disagg_spec = tmp_disagg_tracker.pop(new_request.req_id, None)
@@ -209,6 +222,7 @@ class RequestTracker:
         lmcache_cached_tokens: int = 0,
         vllm_cached_tokens: int = 0,
         all_token_ids: Optional[list[int]] = None,
+        attention_group_indices: Optional[list[int]] = None,
     ) -> None:
         """Update the request tracker when a running request is
         scheduled again
@@ -217,6 +231,10 @@ class RequestTracker:
         is only used for preempted requests
         all_token_ids: the full token list from the vLLM request, used to
         restore token_ids for preempted requests to ensure chunk keys match
+        attention_group_indices: which entries of a tuple-form
+            ``new_block_ids`` correspond to attention kv-cache groups —
+            same convention as ``from_new_request``. None falls back to
+            the legacy first-group-only behavior for backward compat.
         """
 
         if new_block_ids is None:
@@ -227,7 +245,21 @@ class RequestTracker:
         elif len(new_block_ids) == 0:
             new_block_ids = []
         elif isinstance(new_block_ids, tuple):
-            new_block_ids = new_block_ids[0]
+            # Hybrid memory allocator: tuple of per-group block-id lists.
+            # Concatenate entries for the attention groups; fall back to
+            # the first group when caller hasn't supplied indices.
+            indices = attention_group_indices
+            if indices is None:
+                indices = [0]
+            flat: list[int] = []
+            for gi in indices:
+                if gi < len(new_block_ids):
+                    grp = new_block_ids[gi]
+                    if isinstance(grp, list):
+                        flat.extend(grp)
+                    else:
+                        flat.append(grp)
+            new_block_ids = flat
         elif isinstance(new_block_ids, list):
             # If input is a list, flatten it to handle potential nesting.
             # This also correctly processes already-flat lists.
@@ -832,8 +864,60 @@ class LMCacheConnectorV1Impl:
             )
             kv_caches = {k: v for k, v in kv_caches.items() if isinstance(v, torch.Tensor)}
         self.kv_caches = kv_caches
+        # Identify which kv_cache_groups are attention (vs MambaSpec) so
+        # the per-request block-id tuples vLLM hands us under HMA can be
+        # filtered to attention groups only. See `RequestTracker.from_new_request`.
+        self._attention_group_indices = self._compute_attention_group_indices()
+        logger.info(
+            "Attention group indices: %s (out of %d kv_cache_groups)",
+            self._attention_group_indices,
+            len(getattr(getattr(self._parent, "_kv_cache_config", None),
+                        "kv_cache_groups", []) or []),
+        )
         self._build_kv_layer_groups()
         self._manager.post_init()
+
+    def _compute_attention_group_indices(self) -> list[int]:
+        """Identify which ``kv_cache_groups`` the worker received are
+        attention-bearing (i.e. need their KV blocks tracked by LMCache).
+
+        vLLM's hybrid memory allocator wraps every layer in a
+        ``KVCacheGroup`` keyed by spec class. ``MambaSpec`` groups hold
+        Mamba/linear-attention recurrent state that lives in vLLM's
+        block pool but is *not* part of the attention KV that LMCache
+        externalises — those blocks must be skipped when LMCache turns
+        the per-request block-id tuple into a flat list.
+
+        We also need this list to be stable for the lifetime of the
+        worker (it's computed once after ``register_kv_caches``).
+
+        Returns:
+            list of indices into ``kv_cache_config.kv_cache_groups``
+            for groups whose ``kv_cache_spec`` is an attention spec
+            (FullAttentionSpec / SlidingWindowSpec / MLAAttentionSpec).
+            Falls back to ``[0]`` when the connector is talking to an
+            older vLLM that doesn't expose ``_kv_cache_config`` (then
+            block_ids is the legacy single flat list anyway).
+        """
+        kv_cache_config = getattr(self._parent, "_kv_cache_config", None)
+        groups = getattr(kv_cache_config, "kv_cache_groups", None) if kv_cache_config else None
+        if not groups:
+            return [0]
+        indices: list[int] = []
+        for i, g in enumerate(groups):
+            spec = getattr(g, "kv_cache_spec", None)
+            spec_name = type(spec).__name__ if spec is not None else "None"
+            # Skip Mamba/linear-attention groups — LMCache doesn't externalise
+            # their state. The hybrid_mamba_state_io sidecar handles those
+            # via dedicated save/restore hooks.
+            if spec_name == "MambaSpec":
+                continue
+            indices.append(i)
+        if not indices:
+            # Defensive: if we couldn't classify any group, keep the
+            # original first-group behaviour.
+            return [0]
+        return indices
 
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
